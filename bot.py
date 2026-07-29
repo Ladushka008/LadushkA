@@ -4,6 +4,7 @@ import base64
 import sqlite3
 import asyncio
 import aiohttp
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
@@ -14,9 +15,10 @@ from aiogram.client.default import DefaultBotProperties
 # ==========================================
 # ⚙️ НАСТРОЙКИ (ENVIRONMENT VARIABLES)
 # ==========================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8529768374:AAFgDuE2JZK0pztboi-jeS_prjvqdFyQgQw")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8529768374:AAFPcbC4fOtp_roH6k2fMHQ3UCOxtceY8DM")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7837011810"))
-PING_URL = os.getenv("PING_URL", "https://ladushka.onrender.com/")
+PING_URL = os.getenv("PING_URL", "https://iris-store-bot.onrender.com/")
+PORT = int(os.getenv("PORT", 8080))  # Порт для Render
 
 # Файл базы данных SQLite
 DB_FILE = "ladushki.db"
@@ -28,6 +30,23 @@ GITHUB_REPO = os.getenv("GITHUB_REPO", "")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
 
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{DB_FILE}"
+
+# ==========================================
+# 🌐 МИНИ ВЕБ-СЕРВЕР ДЛЯ RENDER (HEALTH CHECK)
+# ==========================================
+async def handle_ping(request):
+    return web.Response(text="Bot is running!")
+
+async def start_web_server():
+    """Запускает простейший HTTP-сервер, чтобы Render видел открытый порт."""
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    app.router.add_get("/ping", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    print(f"🌐 HTTP Веб-сервер запущен на порту {PORT}")
 
 # ==========================================
 # 🗄️ БАЗА ДАННЫХ (SQLITE)
@@ -384,18 +403,21 @@ async def top(message: Message):
 # 🚀 ТОЧКА ВХОДА
 # ==========================================
 async def main():
-    # 1. Скачиваем актуальную версию SQLite из GitHub при старте
+    # 1. Запуск веб-сервера для прохождения проверки порта на Render
+    await start_web_server()
+
+    # 2. Скачиваем актуальную версию SQLite из GitHub при старте
     await download_db_from_github()
 
-    # 2. Инициализируем локальную структуру таблиц
+    # 3. Инициализируем локальную структуру таблиц
     init_db()
 
-    # 3. Запускаем фоновые задачи
+    # 4. Запускаем фоновые задачи
     asyncio.create_task(auto_ping_task())
     asyncio.create_task(auto_clean_db_task())
     asyncio.create_task(auto_github_sync_task())
 
-    # 4. Запускаем бота
+    # 5. Запускаем бота
     await dp.start_polling(bot)
 
 
