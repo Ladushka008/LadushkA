@@ -14,7 +14,7 @@ from aiogram.client.default import DefaultBotProperties
 # ==========================================
 # ⚙️ НАСТРОЙКИ (ENVIRONMENT VARIABLES)
 # ==========================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8529768374:AAFPcbC4fOtp_roH6k2fMHQ3UCOxtceY8DM")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8529768374:AAFgDuE2JZK0pztboi-jeS_prjvqdFyQgQw")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7837011810"))
 PING_URL = os.getenv("PING_URL", "https://ladushka.onrender.com/")
 
