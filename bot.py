@@ -9,7 +9,7 @@ from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
 # ⚙️ НАСТРОЙКИ
-TOKEN = "ВСТАВЬ_СЮДА_ТОКЕН_ОТ_BOTFATHER"
+TOKEN = "8529768374:AAHJTK9u7zckUSPKI7lQS4LSEkGRvi_t5i8"
 ADMIN_ID = 7837011810
 PING_URL = "https://iris-store-bot.onrender.com/"
 
