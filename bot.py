@@ -8,6 +8,7 @@ from aiogram.types import Message
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
+# ⚙️ НАСТРОЙКИ
 TOKEN = "ВСТАВЬ_СЮДА_ТОКЕН_ОТ_BOTFATHER"
 ADMIN_ID = 7837011810
 PING_URL = "https://iris-store-bot.onrender.com/"
@@ -27,13 +28,14 @@ CREATE TABLE IF NOT EXISTS users(
     user_id INTEGER PRIMARY KEY,
     username TEXT,
     balance INTEGER DEFAULT 0,
-    last_daily INTEGER DEFAULT 0
+    last_daily INTEGER DEFAULT 0,
+    last_active INTEGER DEFAULT 0
 )
 """)
 db.commit()
 
 
-# Автопинг каждые 5 минут
+# --- Фоновая задача: Автопинг каждые 5 минут ---
 async def auto_ping_task():
     async with aiohttp.ClientSession() as session:
         while True:
@@ -42,14 +44,43 @@ async def auto_ping_task():
                     print(f"Ping OK: {response.status}")
             except Exception as e:
                 print("Ping error:", e)
-            
             await asyncio.sleep(300)
 
 
+# --- Фоновая задача: Автоочистка базы раз в 24 часа ---
+async def auto_clean_db_task():
+    while True:
+        try:
+            now = int(time.time())
+            # Удаляем пользователей с 0 балансом, которые не заходили более 30 дней (2 592 000 сек)
+            thirty_days = 30 * 86400
+            cursor.execute("""
+            DELETE FROM users 
+            WHERE balance = 0 AND (?-last_active > ? OR last_active = 0)
+            """, (now, thirty_days))
+            
+            db.commit()
+            # Оптимизация размера файла базы данных
+            cursor.execute("VACUUM")
+            db.commit()
+            print("🧹 Автоочистка базы данных успешно выполнена")
+        except Exception as e:
+            print("Ошибка при очистке БД:", e)
+        
+        # Запуск очистки раз в сутки (86400 секунд)
+        await asyncio.sleep(86400)
+
+
+# Регистрация и обновление активности пользователя
 def get_user(user_id, username):
+    now = int(time.time())
     cursor.execute(
-        "INSERT OR IGNORE INTO users(user_id, username) VALUES(?,?)",
-        (user_id, username)
+        "INSERT OR IGNORE INTO users(user_id, username, last_active) VALUES(?,?,?)",
+        (user_id, username, now)
+    )
+    cursor.execute(
+        "UPDATE users SET username=?, last_active=? WHERE user_id=?",
+        (username, now, user_id)
     )
     db.commit()
 
@@ -68,7 +99,8 @@ async def balance(message: Message):
         "SELECT balance FROM users WHERE user_id=?",
         (message.from_user.id,)
     )
-    user_balance = cursor.fetchone()[0]
+    res = cursor.fetchone()
+    user_balance = res[0] if res else 0
 
     await message.answer(f"👏 Ваш баланс: <b>{user_balance}</b> ладушек")
 
@@ -86,10 +118,7 @@ async def give(message: Message):
     user_id = int(args[1])
     amount = int(args[2])
 
-    cursor.execute(
-        "INSERT OR IGNORE INTO users(user_id, username) VALUES(?,?)",
-        (user_id, "Пользователь")
-    )
+    get_user(user_id, "Пользователь")
     cursor.execute(
         "UPDATE users SET balance = balance + ? WHERE user_id=?",
         (amount, user_id)
@@ -174,6 +203,8 @@ async def daily(message: Message):
 
 @dp.message(Command("топ"))
 async def top(message: Message):
+    get_user(message.from_user.id, message.from_user.full_name)
+    
     cursor.execute(
         "SELECT username, balance FROM users ORDER BY balance DESC LIMIT 10"
     )
@@ -187,7 +218,9 @@ async def top(message: Message):
 
 
 async def main():
+    # Запускаем фоновый пинг и автоочистку БД
     asyncio.create_task(auto_ping_task())
+    asyncio.create_task(auto_clean_db_task())
     await dp.start_polling(bot)
 
 
