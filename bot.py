@@ -285,7 +285,8 @@ async def start(message: Message):
         "• Напишите <b>магазин</b> — чтобы открыть магазин предметов.\n"
         "• Напишите <b>инвентарь</b> — чтобы посмотреть свои предметы.\n"
         "• Ответьте на сообщение текстом <b>дать 50</b> — чтобы перевести ладушки.\n"
-        "• Ответьте на сообщение текстом <b>ударить ладушкой</b> — применить Боевую ладушку."
+        "• Ответьте на сообщение текстом <b>ударить ладушкой</b> — применить Боевую ладушку.\n"
+        "• Ответьте на сообщение текстом <b>кинуть томат</b> — бросить томат в участника."
     )
 
 
@@ -358,9 +359,11 @@ async def get_daily_bonus(message: Message):
 async def shop_handler(message: Message):
     text = (
         "🛒 <b>Магазин Ладушек</b>\n\n"
-        "🥊 <b>Боевая ладушка</b> — 200 ладушек\n\n"
+        "🥊 <b>Боевая ладушка</b> — 200 ладушек\n"
+        "🍅 <b>Томат</b> — 100 ладушек\n\n"
         "Для покупки:\n"
-        "<code>купить ладушка</code>"
+        "<code>купить ладушка</code>\n"
+        "<code>купить томат</code>"
     )
     await message.answer(text)
 
@@ -394,6 +397,35 @@ async def buy_battle_ladushka(message: Message):
     )
 
 
+@dp.message(F.text.lower() == "купить томат")
+async def buy_tomato(message: Message):
+    user = message.from_user
+    register_user(user)
+    
+    price = 100
+    user_bal = get_balance(user.id)
+
+    if user_bal < price:
+        await message.reply(
+            f"❌ <b>Недостаточно ладушек.</b>\n\n"
+            f"Ваш баланс: <b>{user_bal}</b> ладушек"
+        )
+        return
+
+    # Списываем средства и добавляем предмет
+    cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (price, user.id))
+    db.commit()
+    
+    add_item(user.id, "tomato", 1)
+    add_history(user.id, 0, price, "buy_item", "Томат")
+
+    await message.reply(
+        "✅ <b>Покупка успешна!</b>\n\n"
+        "🍅 <b>Получено:</b> Томат ×1\n"
+        f"💰 <b>Списано:</b> {price} ладушек"
+    )
+
+
 @dp.message(F.text.lower() == "инвентарь")
 async def inventory_handler(message: Message):
     user = message.from_user
@@ -410,6 +442,8 @@ async def inventory_handler(message: Message):
     for item_name, quantity in rows:
         if item_name == "battle_ladushka":
             text += f"🥊 <b>Боевая ладушка</b> ×{quantity}\n"
+        elif item_name == "tomato":
+            text += f"🍅 <b>Томат</b> ×{quantity}\n"
         else:
             text += f"📦 <b>{item_name}</b> ×{quantity}\n"
 
@@ -447,6 +481,43 @@ async def hit_with_ladushka(message: Message):
         f"🥊 {sender_link} ударил ладушкой {receiver_link}!\n\n👏 <b>ШЛЁП!</b>",
         f"💥 {sender_link} размахнулся и влепил ладушку {receiver_link}!",
         f"🏛 <b>Министр Ладушек одобрил удар.</b>\n\n🥊 {sender_link} ударил {receiver_link} ладушкой!"
+    ]
+
+    selected_phrase = random.choice(phrases)
+    await message.reply(selected_phrase, disable_web_page_preview=True)
+
+
+@dp.message(F.text.lower() == "кинуть томат")
+async def throw_tomato(message: Message):
+    if not message.reply_to_message:
+        await message.reply("⚠️ Эта команда должна быть ответом на сообщение пользователя!")
+        return
+
+    sender = message.from_user
+    receiver = message.reply_to_message.from_user
+
+    register_user(sender)
+    register_user(receiver)
+
+    count = get_item_quantity(sender.id, "tomato")
+    if count <= 0:
+        await message.reply(
+            "❌ <b>У вас нет томатов.</b>\n\n"
+            "🛒 Купить можно в магазине за 100 ладушек."
+        )
+        return
+
+    # Списываем 1 томат
+    remove_item(sender.id, "tomato", 1)
+
+    sender_link = get_user_mention(sender)
+    receiver_link = get_user_mention(receiver)
+
+    # Варианты сообщений
+    phrases = [
+        f"🍅 {sender_link} кинул томат в {receiver_link}!\n\n🤭 Теперь {receiver_link} весь в томате.",
+        f"🍅 {sender_link} запустил томат в {receiver_link}!\n\n💥 Прямое попадание!\n\n😂 {receiver_link} весь в кетчупе.",
+        f"🎯 <b>Меткий бросок!</b>\n\n🍅 {receiver_link} теперь весь в томатном соке."
     ]
 
     selected_phrase = random.choice(phrases)
