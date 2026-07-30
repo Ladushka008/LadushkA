@@ -41,6 +41,9 @@ bot = Bot(
 
 dp = Dispatcher()
 
+db = None
+cursor = None
+
 
 # ==========================
 # GITHUB СИНХРОНИЗАЦИЯ (REST API)
@@ -49,7 +52,7 @@ dp = Dispatcher()
 def _sync_download():
     """Синхронная функция скачивания базы из GitHub"""
     if not GITHUB_TOKEN or not GITHUB_REPO:
-        print("GitHub sync failed: GITHUB_TOKEN or GITHUB_REPO missing")
+        print("GitHub sync failed")
         return False
 
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
@@ -59,7 +62,7 @@ def _sync_download():
     }
 
     try:
-        response = requests.get(url, headers=headers, params={"ref": BRANCH})
+        response = requests.get(url, headers=headers, params={"ref": BRANCH}, timeout=10)
         if response.status_code == 200:
             content_b64 = response.json().get("content", "")
             file_data = base64.b64decode(content_b64)
@@ -78,11 +81,11 @@ def _sync_download():
 def _sync_upload():
     """Синхронная функция отправки базы в GitHub"""
     if not GITHUB_TOKEN or not GITHUB_REPO:
-        print("GitHub sync failed: GITHUB_TOKEN or GITHUB_REPO missing")
+        print("GitHub sync failed")
         return False
 
     if not os.path.exists(DB_FILE):
-        print("GitHub sync failed: Local DB file not found")
+        print("GitHub sync failed")
         return False
 
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
@@ -92,18 +95,15 @@ def _sync_upload():
     }
 
     try:
-        # 1. Читаем локальный файл
         with open(DB_FILE, "rb") as f:
             content_bytes = f.read()
         content_b64 = base64.b64encode(content_bytes).decode("utf-8")
 
-        # 2. Получаем sha существующего файла (если он есть)
         sha = None
-        get_resp = requests.get(url, headers=headers, params={"ref": BRANCH})
+        get_resp = requests.get(url, headers=headers, params={"ref": BRANCH}, timeout=10)
         if get_resp.status_code == 200:
             sha = get_resp.json().get("sha")
 
-        # 3. Подготавливаем payload
         data = {
             "message": "Auto-update database.db",
             "content": content_b64,
@@ -112,8 +112,7 @@ def _sync_upload():
         if sha:
             data["sha"] = sha
 
-        # 4. Загружаем файл
-        put_resp = requests.put(url, headers=headers, json=data)
+        put_resp = requests.put(url, headers=headers, json=data, timeout=10)
         if put_resp.status_code in [200, 201]:
             print("Database uploaded to GitHub")
             return True
@@ -125,49 +124,48 @@ def _sync_upload():
         return False
 
 
-def download_database_from_github():
-    """Проверка наличия файла и его загрузка из GitHub при старте"""
+async def download_database_from_github():
+    """Скачивание базы, если её нет локально"""
     if not os.path.exists(DB_FILE):
-        _sync_download()
+        await asyncio.to_thread(_sync_download)
 
 
 async def upload_database_to_github():
-    """Асинхронный вызов отправки базы данных в GitHub"""
+    """Вызов загрузки файла базы на GitHub"""
     await asyncio.to_thread(_sync_upload)
 
 
 # ==========================
-# БАЗА ДАННЫХ
+# БАЗА ДАННЫХ И ИНИЦИАЛИЗАЦИЯ
 # ==========================
 
-# Проверяем и скачиваем БД из GitHub до открытия соединения
-download_database_from_github()
+def init_db():
+    global db, cursor
+    db = sqlite3.connect(DB_FILE, check_same_thread=False)
+    cursor = db.cursor()
 
-db = sqlite3.connect(DB_FILE, check_same_thread=False)
-cursor = db.cursor()
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS users(
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        full_name TEXT,
+        balance INTEGER DEFAULT 0
+    )
+    """)
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS users(
-    user_id INTEGER PRIMARY KEY,
-    username TEXT,
-    full_name TEXT,
-    balance INTEGER DEFAULT 0
-)
-""")
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS history(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender INTEGER,
+        receiver INTEGER,
+        amount INTEGER,
+        action TEXT,
+        reason TEXT,
+        date TEXT
+    )
+    """)
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS history(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    sender INTEGER,
-    receiver INTEGER,
-    amount INTEGER,
-    action TEXT,
-    reason TEXT,
-    date TEXT
-)
-""")
-
-db.commit()
+    db.commit()
 
 
 # ==========================
@@ -465,12 +463,20 @@ async def reset(message: Message):
 # ==========================
 
 async def on_startup(bot: Bot):
+    # 1. Скачиваем базу при запуске сервиса
+    await download_database_from_github()
+    
+    # 2. Инициализируем подключение к SQLite
+    init_db()
+    
+    # 3. Устанавливаем Webhook для приема сообщений
     await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
 
 
 async def on_shutdown(bot: Bot):
     await bot.delete_webhook()
-    db.close()
+    if db:
+        db.close()
 
 
 def main():
