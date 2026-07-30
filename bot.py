@@ -1,6 +1,8 @@
 import os
+import base64
 import asyncio
 import sqlite3
+import requests
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
@@ -15,14 +17,17 @@ from aiohttp import web
 # НАСТРОЙКИ (Переменные окружения)
 # ==========================
 
-# 1. Токен получаем по КЛЮЧУ переменной "BOT_TOKEN"
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7837011810"))
-
-# Render автоматически передает PORT. По умолчанию 8080.
 PORT = int(os.getenv("PORT", 8080))
 
-# URL вашего сервиса на Render (автоматически удаляем лишние / и /webhook на конце)
+# GitHub настройки
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_REPO = os.getenv("GITHUB_REPO")  # Например "Ladushka008/LadushkA"
+DB_FILE = "database.db"
+GITHUB_FILE_PATH = "database.db"
+BRANCH = "main"
+
 raw_url = (os.getenv("WEBHOOK_URL") or "").strip()
 WEBHOOK_HOST = raw_url.removesuffix("/").removesuffix("/webhook").removesuffix("/")
 
@@ -36,11 +41,109 @@ bot = Bot(
 
 dp = Dispatcher()
 
+
+# ==========================
+# GITHUB СИНХРОНИЗАЦИЯ (REST API)
+# ==========================
+
+def _sync_download():
+    """Синхронная функция скачивания базы из GitHub"""
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        print("GitHub sync failed: GITHUB_TOKEN or GITHUB_REPO missing")
+        return False
+
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+
+    try:
+        response = requests.get(url, headers=headers, params={"ref": BRANCH})
+        if response.status_code == 200:
+            content_b64 = response.json().get("content", "")
+            file_data = base64.b64decode(content_b64)
+            with open(DB_FILE, "wb") as f:
+                f.write(file_data)
+            print("Database downloaded from GitHub")
+            return True
+        else:
+            print("GitHub sync failed")
+            return False
+    except Exception:
+        print("GitHub sync failed")
+        return False
+
+
+def _sync_upload():
+    """Синхронная функция отправки базы в GitHub"""
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        print("GitHub sync failed: GITHUB_TOKEN or GITHUB_REPO missing")
+        return False
+
+    if not os.path.exists(DB_FILE):
+        print("GitHub sync failed: Local DB file not found")
+        return False
+
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+
+    try:
+        # 1. Читаем локальный файл
+        with open(DB_FILE, "rb") as f:
+            content_bytes = f.read()
+        content_b64 = base64.b64encode(content_bytes).decode("utf-8")
+
+        # 2. Получаем sha существующего файла (если он есть)
+        sha = None
+        get_resp = requests.get(url, headers=headers, params={"ref": BRANCH})
+        if get_resp.status_code == 200:
+            sha = get_resp.json().get("sha")
+
+        # 3. Подготавливаем payload
+        data = {
+            "message": "Auto-update database.db",
+            "content": content_b64,
+            "branch": BRANCH
+        }
+        if sha:
+            data["sha"] = sha
+
+        # 4. Загружаем файл
+        put_resp = requests.put(url, headers=headers, json=data)
+        if put_resp.status_code in [200, 201]:
+            print("Database uploaded to GitHub")
+            return True
+        else:
+            print("GitHub sync failed")
+            return False
+    except Exception:
+        print("GitHub sync failed")
+        return False
+
+
+def download_database_from_github():
+    """Проверка наличия файла и его загрузка из GitHub при старте"""
+    if not os.path.exists(DB_FILE):
+        _sync_download()
+
+
+async def upload_database_to_github():
+    """Асинхронный вызов отправки базы данных в GitHub"""
+    await asyncio.to_thread(_sync_upload)
+
+
 # ==========================
 # БАЗА ДАННЫХ
 # ==========================
 
-db = sqlite3.connect("ladushki.db", check_same_thread=False)
+# Проверяем и скачиваем БД из GitHub до открытия соединения
+download_database_from_github()
+
+db = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = db.cursor()
 
 cursor.execute("""
@@ -71,7 +174,7 @@ db.commit()
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==========================
 
-def register_user(user):
+async def register_user(user):
     cursor.execute(
         """
         INSERT OR IGNORE INTO users(user_id, username, full_name, balance)
@@ -89,6 +192,7 @@ def register_user(user):
         (user.username, user.full_name, user.id)
     )
     db.commit()
+    await upload_database_to_github()
 
 
 def get_balance(user_id):
@@ -103,7 +207,7 @@ def profile_link(user):
     return f"tg://user?id={user.id}"
 
 
-def add_history(sender, receiver, amount, action, reason=""):
+async def add_history(sender, receiver, amount, action, reason=""):
     cursor.execute(
         """
         INSERT INTO history(sender, receiver, amount, action, reason, date)
@@ -119,6 +223,7 @@ def add_history(sender, receiver, amount, action, reason=""):
         )
     )
     db.commit()
+    await upload_database_to_github()
 
 
 def is_admin(user_id: int):
@@ -131,7 +236,7 @@ def is_admin(user_id: int):
 
 @dp.message(Command("start"))
 async def start(message: Message):
-    register_user(message.from_user)
+    await register_user(message.from_user)
     await message.answer(
         "👋 Добро пожаловать!\n\n"
         "Это бот группы <b>Ладушки</b>.\n\n"
@@ -141,12 +246,12 @@ async def start(message: Message):
 
 @dp.message(F.text.lower() == "баланс")
 async def balance(message: Message):
-    register_user(message.from_user)
+    await register_user(message.from_user)
     target = message.from_user
 
     if message.reply_to_message:
         target = message.reply_to_message.from_user
-        register_user(target)
+        await register_user(target)
 
     user_balance = get_balance(target.id)
 
@@ -171,8 +276,8 @@ async def transfer_ladushka(message: Message):
         await message.reply("❌ Нельзя передавать ладушки самому себе.")
         return
 
-    register_user(sender)
-    register_user(receiver)
+    await register_user(sender)
+    await register_user(receiver)
 
     sender_balance = get_balance(sender.id)
 
@@ -184,7 +289,7 @@ async def transfer_ladushka(message: Message):
     cursor.execute("UPDATE users SET balance = balance + 1 WHERE user_id=?", (receiver.id,))
     db.commit()
 
-    add_history(sender.id, receiver.id, 1, "transfer")
+    await add_history(sender.id, receiver.id, 1, "transfer")
 
     await message.reply(
         "🪙 <b>Ладушка передана!</b>\n\n"
@@ -255,10 +360,11 @@ async def add_balance(message: Message):
         return
 
     user = message.reply_to_message.from_user
-    register_user(user)
+    await register_user(user)
     cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user.id))
     db.commit()
-    add_history(ADMIN_ID, user.id, amount, "add")
+
+    await add_history(ADMIN_ID, user.id, amount, "add")
     await message.answer(f"✅ {user.full_name} получил {amount} ладушек.")
 
 
@@ -277,7 +383,8 @@ async def remove_balance(message: Message):
     user = message.reply_to_message.from_user
     cursor.execute("UPDATE users SET balance = MAX(balance-?,0) WHERE user_id=?", (amount, user.id))
     db.commit()
-    add_history(ADMIN_ID, user.id, amount, "remove")
+
+    await add_history(ADMIN_ID, user.id, amount, "remove")
     await message.answer("✅ Ладушки сняты.")
 
 
@@ -288,10 +395,16 @@ async def set_balance(message: Message):
     args = message.text.split()
     if len(args) != 2:
         return
-    amount = int(args[1])
+    try:
+        amount = int(args[1])
+    except ValueError:
+        return
+
     user = message.reply_to_message.from_user
     cursor.execute("UPDATE users SET balance=? WHERE user_id=?", (amount, user.id))
     db.commit()
+    await upload_database_to_github()
+
     await message.answer("✅ Баланс изменён.")
 
 
@@ -302,10 +415,16 @@ async def fine(message: Message):
     args = message.text.split()
     if len(args) < 2:
         return
-    amount = int(args[1])
+    try:
+        amount = int(args[1])
+    except ValueError:
+        return
+
     user = message.reply_to_message.from_user
     cursor.execute("UPDATE users SET balance = MAX(balance-?,0) WHERE user_id=?", (amount, user.id))
     db.commit()
+    await upload_database_to_github()
+
     await message.answer(f"⚠️ Игрок {user.full_name} получил штраф {amount} ладушек.")
 
 
@@ -316,10 +435,16 @@ async def bonus(message: Message):
     args = message.text.split()
     if len(args) < 2:
         return
-    amount = int(args[1])
+    try:
+        amount = int(args[1])
+    except ValueError:
+        return
+
     user = message.reply_to_message.from_user
     cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user.id))
     db.commit()
+    await upload_database_to_github()
+
     await message.answer(f"🎁 Игрок {user.full_name} получил бонус {amount} ладушек.")
 
 
@@ -330,6 +455,8 @@ async def reset(message: Message):
     user = message.reply_to_message.from_user
     cursor.execute("UPDATE users SET balance=0 WHERE user_id=?", (user.id,))
     db.commit()
+    await upload_database_to_github()
+
     await message.answer("♻️ Баланс игрока сброшен.")
 
 
@@ -338,12 +465,13 @@ async def reset(message: Message):
 # ==========================
 
 async def on_startup(bot: Bot):
-    # Очищаем старые очереди и устанавливаем точный вебхук
     await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+
 
 async def on_shutdown(bot: Bot):
     await bot.delete_webhook()
     db.close()
+
 
 def main():
     dp.startup.register(on_startup)
@@ -360,6 +488,7 @@ def main():
     setup_application(app, dp, bot=bot)
 
     web.run_app(app, host="0.0.0.0", port=PORT)
+
 
 if __name__ == "__main__":
     main()
