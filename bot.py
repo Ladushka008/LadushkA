@@ -15,17 +15,17 @@ from aiohttp import web
 # НАСТРОЙКИ (Переменные окружения)
 # ==========================
 
-# Считываем токен из переменной окружения BOT_TOKEN
+# 1. Токен получаем по КЛЮЧУ переменной "BOT_TOKEN"
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7837011810"))
 
 # Render автоматически передает PORT. По умолчанию 8080.
 PORT = int(os.getenv("PORT", 8080))
 
-# URL вашего сервиса на Render (например, https://my-bot.onrender.com)
-WEBHOOK_HOST = os.getenv("WEBHOOK_URL")
+# URL вашего сервиса на Render (убираем лишний слэш в конце, если он есть)
+WEBHOOK_HOST = (os.getenv("WEBHOOK_URL") or "").rstrip("/")
 WEBHOOK_PATH = f"/webhook/{TOKEN}"
-WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}" if WEBHOOK_HOST else None
+WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
 bot = Bot(
     token=TOKEN,
@@ -336,8 +336,8 @@ async def reset(message: Message):
 # ==========================
 
 async def on_startup(bot: Bot):
-    if WEBHOOK_URL:
-        await bot.set_webhook(WEBHOOK_URL)
+    # Очищаем старые очереди и устанавливаем точный вебхук
+    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
 
 async def on_shutdown(bot: Bot):
     await bot.delete_webhook()
