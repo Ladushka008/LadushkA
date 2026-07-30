@@ -5,6 +5,7 @@ import sqlite3
 import requests
 import aiohttp
 import zoneinfo
+import random
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
@@ -140,9 +141,16 @@ def init_db():
         user_id INTEGER PRIMARY KEY,
         username TEXT,
         full_name TEXT,
-        balance INTEGER DEFAULT 0
+        balance INTEGER DEFAULT 0,
+        last_bonus TEXT
     )
     """)
+
+    # Миграция: добавляем колонку last_bonus, если её ещё нет в существующей базе
+    cursor.execute("PRAGMA table_info(users)")
+    columns = [column[1] for column in cursor.fetchall()]
+    if "last_bonus" not in columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN last_bonus TEXT")
 
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS history(
@@ -169,8 +177,8 @@ init_db()
 def register_user(user):
     cursor.execute(
         """
-        INSERT OR IGNORE INTO users(user_id, username, full_name, balance)
-        VALUES(?,?,?,0)
+        INSERT OR IGNORE INTO users(user_id, username, full_name, balance, last_bonus)
+        VALUES(?,?,?,0,NULL)
         """,
         (user.id, user.username, user.full_name)
     )
@@ -236,6 +244,7 @@ async def start(message: Message):
         "✨ <b>Добро пожаловать в бота сообщества Ладушки!</b>\n\n"
         "💬 <b>Команды:</b>\n"
         "• Напишите <b>баланс</b> — чтобы узнать счет.\n"
+        "• Напишите <b>бонус</b> — чтобы получить ежедневный бонус.\n"
         "• Ответьте на сообщение текстом <b>дать 50</b> — чтобы перевести ладушки."
     )
 
@@ -258,6 +267,47 @@ async def balance(message: Message):
     )
 
     await message.answer(text, disable_web_page_preview=True)
+
+
+@dp.message(F.text.lower() == "бонус")
+async def get_daily_bonus(message: Message):
+    user = message.from_user
+    register_user(user)
+
+    cursor.execute("SELECT last_bonus FROM users WHERE user_id=?", (user.id,))
+    row = cursor.fetchone()
+    last_bonus_str = row[0] if row else None
+
+    now = datetime.now()
+
+    if last_bonus_str:
+        last_bonus_time = datetime.fromisoformat(last_bonus_str)
+        next_bonus_time = last_bonus_time + timedelta(hours=24)
+
+        if now < next_bonus_time:
+            time_left = next_bonus_time - now
+            hours = time_left.seconds // 3600
+            minutes = (time_left.seconds % 3600) // 60
+            await message.reply(
+                f"⏳ <b>Бонус уже получен.</b>\n"
+                f"Следующий бонус будет доступен через <b>{hours} ч. {minutes} мин.</b>"
+            )
+            return
+
+    reward = random.randint(1, 5)
+
+    cursor.execute(
+        "UPDATE users SET balance = balance + ?, last_bonus = ? WHERE user_id=?",
+        (reward, now.isoformat(), user.id)
+    )
+    db.commit()
+
+    add_history(0, user.id, reward, "daily_bonus")
+
+    await message.reply(
+        f"🎁 <b>Ежедневный бонус!</b>\n\n"
+        f"💰 Ты получил: <b>+{reward}</b> ладушки"
+    )
 
 
 @dp.message(F.text.lower().startswith("дать "))
@@ -491,8 +541,8 @@ async def fine(message: Message):
     await message.answer(f"⚠️ Игрок {user_link} получил штраф {amount} ладушек.", disable_web_page_preview=True)
 
 
-@dp.message(Command("bonus"))
-async def bonus(message: Message):
+@dp.message(Command("admin_bonus"))
+async def admin_bonus(message: Message):
     if not is_admin(message.from_user.id) or not message.reply_to_message:
         return
     args = message.text.split()
