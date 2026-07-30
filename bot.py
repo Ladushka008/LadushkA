@@ -4,7 +4,8 @@ import asyncio
 import sqlite3
 import requests
 import aiohttp
-from datetime import datetime
+import zoneinfo
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
@@ -20,6 +21,9 @@ from aiohttp import web
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7837011810"))
 PORT = int(os.getenv("PORT", 8080))
+
+# Ссылка или ID вашей группы (по умолчанию @ladushka09)
+GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID", "@ladushka09")
 
 # GitHub настройки
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
@@ -521,7 +525,7 @@ async def reset(message: Message):
 
 
 # ==========================
-# ВЕБ-СЕРВЕР И АВТОПИНГ (KEEP-ALIVE)
+# ВЕБ-СЕРВЕР, АВТОПИНГ И РАССЫЛКА
 # ==========================
 
 async def handle_ping(request):
@@ -536,17 +540,15 @@ async def start_web_server():
     await site.start()
     print(f"Web server started on port {PORT}")
 
+
 async def auto_ping_task():
-    """Фоновая задача автопинга каждые 4 минуты с гарантированной повторной попыткой"""
+    """Фоновая задача автопинга каждые 4 минуты"""
     ping_url = "https://ladushka.onrender.com/"
-    
-    # Ждём пару секунд перед первым пингом
     await asyncio.sleep(10)
     
     async with aiohttp.ClientSession() as session:
         while True:
             success = False
-            # Пытаемся стучаться (2 попытки)
             for attempt in range(1, 3):
                 try:
                     async with session.get(ping_url, timeout=10) as response:
@@ -559,20 +561,51 @@ async def auto_ping_task():
                 except Exception as e:
                     print(f"Auto-ping attempt {attempt} error: {e}")
                 
-                # Если первая попытка упала, ждем 5 секунд и делаем повтор
                 if not success and attempt == 1:
                     await asyncio.sleep(5)
 
-            # Каждые 4 минуты (240 секунд)
             await asyncio.sleep(240)
+
+
+async def daily_ladushki_task():
+    """Фоновая задача: рассылка ровно в 19:00 по Киевскому времени в группу @ladushka09"""
+    kyiv_tz = zoneinfo.ZoneInfo("Europe/Kyiv")
+    
+    while True:
+        now = datetime.now(kyiv_tz)
+        target_time = now.replace(hour=19, minute=0, second=0, microsecond=0)
+        
+        # Если 19:00 уже прошло сегодня, переносим на завтра
+        if now >= target_time:
+            target_time += timedelta(days=1)
+        
+        wait_seconds = (target_time - now).total_seconds()
+        print(f"Следующая отправка 'Ладушек' запланирована на {target_time.strftime('%d.%m.%Y %H:%M:%S')} (через {int(wait_seconds)} сек)")
+        
+        await asyncio.sleep(wait_seconds)
+        
+        # Отправка сообщения в группу
+        try:
+            text = (
+                "👏 <b>19:00 — Время петь «Ладушки»!</b> 👏\n\n"
+                "🎶 <i>Ладушки, ладушки, где были? У бабушки!</i> 🎶\n"
+                "✨ Пора забрать свои вечерние ладушки! ✨"
+            )
+            await bot.send_message(chat_id=GROUP_CHAT_ID, text=text)
+            print("Ежедневное сообщение 'Ладушки' успешно отправлено в группу!")
+        except Exception as e:
+            print(f"Ошибка при отправке ежедневного сообщения: {e}")
 
 
 async def main():
     # Запускаем веб-сервер
     await start_web_server()
     
-    # Запускаем фоновый автопинг Render каждые 4 минуты
+    # Запускаем автопинг Render
     asyncio.create_task(auto_ping_task())
+    
+    # Запускаем ежедневную рассылку в 19:00 по Киеву
+    asyncio.create_task(daily_ladushki_task())
     
     # Очищаем вебхук и запускаем polling
     await bot.delete_webhook(drop_pending_updates=True)
