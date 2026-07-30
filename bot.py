@@ -15,15 +15,17 @@ from aiohttp import web
 # НАСТРОЙКИ (Переменные окружения)
 # ==========================
 
-TOKEN = os.getenv("8529768374:AAHUF34sL8NygJousF46asP-FU9-H1U_Oac")
+# Считываем токен из переменной окружения BOT_TOKEN
+TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7837011810"))
 
-# Render автоматически передает PORT. Если локально — по умолчанию 8080.
+# Render автоматически передает PORT. По умолчанию 8080.
 PORT = int(os.getenv("PORT", 8080))
+
 # URL вашего сервиса на Render (например, https://my-bot.onrender.com)
 WEBHOOK_HOST = os.getenv("WEBHOOK_URL")
 WEBHOOK_PATH = f"/webhook/{TOKEN}"
-WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
+WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}" if WEBHOOK_HOST else None
 
 bot = Bot(
     token=TOKEN,
@@ -334,11 +336,10 @@ async def reset(message: Message):
 # ==========================
 
 async def on_startup(bot: Bot):
-    # Автоматически ставим вебхук при запуске сервера
-    await bot.set_webhook(WEBHOOK_URL)
+    if WEBHOOK_URL:
+        await bot.set_webhook(WEBHOOK_URL)
 
 async def on_shutdown(bot: Bot):
-    # Снимаем вебхук и закрываем БД при остановке
     await bot.delete_webhook()
     db.close()
 
@@ -348,7 +349,6 @@ def main():
 
     app = web.Application()
 
-    # Связываем aiogram handler с aiohttp
     webhook_requests_handler = SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
@@ -357,7 +357,6 @@ def main():
 
     setup_application(app, dp, bot=bot)
 
-    # Запускаем aiohttp сервер на порту, требуемом Render
     web.run_app(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
