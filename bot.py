@@ -288,7 +288,7 @@ def remove_item(user_id, item_name, count=1):
 # Отклики на слово "бот"
 @dp.message(F.text.lower() == "бот")
 async def bot_reply(message: Message):
-    await message.reply("Тут я,")
+    await message.reply("Тут я, тут")
 
 
 @dp.message(Command("start"))
