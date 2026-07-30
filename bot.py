@@ -22,8 +22,10 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "7837011810"))
 # Render автоматически передает PORT. По умолчанию 8080.
 PORT = int(os.getenv("PORT", 8080))
 
-# URL вашего сервиса на Render (убираем лишний слэш в конце, если он есть)
-WEBHOOK_HOST = (os.getenv("WEBHOOK_URL") or "").rstrip("/")
+# URL вашего сервиса на Render (автоматически удаляем лишние / и /webhook на конце)
+raw_url = (os.getenv("WEBHOOK_URL") or "").strip()
+WEBHOOK_HOST = raw_url.removesuffix("/").removesuffix("/webhook").removesuffix("/")
+
 WEBHOOK_PATH = f"/webhook/{TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
