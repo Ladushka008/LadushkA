@@ -30,8 +30,9 @@ DB_FILE = "ladushki.db"
 GITHUB_FILE_PATH = "ladushki.db"
 BRANCH = "main"
 
-raw_url = (os.getenv("WEBHOOK_URL") or "").strip()
-WEBHOOK_HOST = raw_url.removesuffix("/").removesuffix("/webhook").removesuffix("/")
+# Автоматически определяем хост через Render или WEBHOOK_URL
+raw_url = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL") or ""
+WEBHOOK_HOST = raw_url.strip().removesuffix("/").removesuffix("/webhook").removesuffix("/")
 
 WEBHOOK_PATH = f"/webhook/{TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
@@ -463,7 +464,7 @@ async def health_check(request):
         info = await bot.get_webhook_info()
         res = (
             f"✅ Бот работает!\n"
-            f"Текущий Webhook URL: {info.url}\n"
+            f"Текущий Webhook URL: {info.url or 'НЕ УСТАНОВЛЕН'}\n"
             f"Ожидают доставки: {info.pending_update_count}\n"
             f"Последняя ошибка Telegram: {info.last_error_message or 'Ошибок нет'}"
         )
@@ -473,8 +474,11 @@ async def health_check(request):
 
 
 async def on_startup(bot: Bot):
-    print(f"Установка Webhook на: {WEBHOOK_URL}")
-    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+    if WEBHOOK_URL.startswith("http"):
+        print(f"Установка Webhook на: {WEBHOOK_URL}")
+        await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+    else:
+        print(f"Ошибка: Некорректный WEBHOOK_URL -> {WEBHOOK_URL}")
 
 
 async def on_shutdown(bot: Bot):
@@ -489,7 +493,6 @@ def main():
 
     app = web.Application()
 
-    # Диагностический эндпоинт для проверки работы
     app.router.add_get("/", health_check)
 
     webhook_requests_handler = SimpleRequestHandler(
