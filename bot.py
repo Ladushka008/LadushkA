@@ -94,7 +94,6 @@ def _sync_upload():
     }
 
     try:
-        # Получаем current sha файла, если он существует
         sha = None
         get_req = urllib.request.Request(f"{url}?ref={BRANCH}", headers=headers)
         try:
@@ -128,7 +127,7 @@ def _sync_upload():
 
 
 def trigger_github_upload():
-    """Фоновая отправка файла на GitHub без задерживания ответа бота"""
+    """Фоновая отправка файла на GitHub"""
     asyncio.create_task(asyncio.to_thread(_sync_upload))
 
 
@@ -466,7 +465,7 @@ async def reset(message: Message):
 # ==========================
 
 async def on_startup(bot: Bot):
-    print(f"Setting webhook to: {WEBHOOK_URL}")
+    print(f"Устанавливаем webhook на: {WEBHOOK_URL}")
     await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
 
 async def on_shutdown(bot: Bot):
