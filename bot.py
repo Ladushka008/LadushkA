@@ -23,7 +23,7 @@ PORT = int(os.getenv("PORT", 8080))
 
 # GitHub настройки
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO = os.getenv("GITHUB_REPO")  # Например "Ladushka008/LadushkA"
+GITHUB_REPO = os.getenv("GITHUB_REPO")  # Пример: Ladushka008/LadushkA
 DB_FILE = "database.db"
 GITHUB_FILE_PATH = "database.db"
 BRANCH = "main"
@@ -41,6 +41,7 @@ bot = Bot(
 
 dp = Dispatcher()
 
+# Инициализируем глобальные переменные БД
 db = None
 cursor = None
 
@@ -50,7 +51,7 @@ cursor = None
 # ==========================
 
 def _sync_download():
-    """Синхронная функция скачивания базы из GitHub"""
+    """Синхронное скачивание базы из GitHub"""
     if not GITHUB_TOKEN or not GITHUB_REPO:
         print("GitHub sync failed")
         return False
@@ -79,7 +80,7 @@ def _sync_download():
 
 
 def _sync_upload():
-    """Синхронная функция отправки базы в GitHub"""
+    """Синхронная отправка базы в GitHub"""
     if not GITHUB_TOKEN or not GITHUB_REPO:
         print("GitHub sync failed")
         return False
@@ -124,23 +125,32 @@ def _sync_upload():
         return False
 
 
-async def download_database_from_github():
-    """Скачивание базы, если её нет локально"""
+def download_database_from_github():
     if not os.path.exists(DB_FILE):
-        await asyncio.to_thread(_sync_download)
+        _sync_download()
 
 
 async def upload_database_to_github():
-    """Вызов загрузки файла базы на GitHub"""
-    await asyncio.to_thread(_sync_upload)
+    """Запуск выгрузки в отдельном потоке"""
+    try:
+        await asyncio.to_thread(_sync_upload)
+    except Exception:
+        print("GitHub sync failed")
+
+
+def trigger_github_upload():
+    """Запуск выгрузки в фоновом режиме, чтобы не задерживать ответ в Telegram"""
+    asyncio.create_task(upload_database_to_github())
 
 
 # ==========================
-# БАЗА ДАННЫХ И ИНИЦИАЛИЗАЦИЯ
+# БАЗА ДАННЫХ
 # ==========================
 
 def init_db():
     global db, cursor
+    download_database_from_github()
+
     db = sqlite3.connect(DB_FILE, check_same_thread=False)
     cursor = db.cursor()
 
@@ -168,11 +178,15 @@ def init_db():
     db.commit()
 
 
+# Инициализируем БД при импорте модуля
+init_db()
+
+
 # ==========================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==========================
 
-async def register_user(user):
+def register_user(user):
     cursor.execute(
         """
         INSERT OR IGNORE INTO users(user_id, username, full_name, balance)
@@ -190,7 +204,7 @@ async def register_user(user):
         (user.username, user.full_name, user.id)
     )
     db.commit()
-    await upload_database_to_github()
+    trigger_github_upload()
 
 
 def get_balance(user_id):
@@ -205,7 +219,7 @@ def profile_link(user):
     return f"tg://user?id={user.id}"
 
 
-async def add_history(sender, receiver, amount, action, reason=""):
+def add_history(sender, receiver, amount, action, reason=""):
     cursor.execute(
         """
         INSERT INTO history(sender, receiver, amount, action, reason, date)
@@ -221,7 +235,7 @@ async def add_history(sender, receiver, amount, action, reason=""):
         )
     )
     db.commit()
-    await upload_database_to_github()
+    trigger_github_upload()
 
 
 def is_admin(user_id: int):
@@ -234,7 +248,7 @@ def is_admin(user_id: int):
 
 @dp.message(Command("start"))
 async def start(message: Message):
-    await register_user(message.from_user)
+    register_user(message.from_user)
     await message.answer(
         "👋 Добро пожаловать!\n\n"
         "Это бот группы <b>Ладушки</b>.\n\n"
@@ -244,12 +258,12 @@ async def start(message: Message):
 
 @dp.message(F.text.lower() == "баланс")
 async def balance(message: Message):
-    await register_user(message.from_user)
+    register_user(message.from_user)
     target = message.from_user
 
     if message.reply_to_message:
         target = message.reply_to_message.from_user
-        await register_user(target)
+        register_user(target)
 
     user_balance = get_balance(target.id)
 
@@ -274,8 +288,8 @@ async def transfer_ladushka(message: Message):
         await message.reply("❌ Нельзя передавать ладушки самому себе.")
         return
 
-    await register_user(sender)
-    await register_user(receiver)
+    register_user(sender)
+    register_user(receiver)
 
     sender_balance = get_balance(sender.id)
 
@@ -287,7 +301,7 @@ async def transfer_ladushka(message: Message):
     cursor.execute("UPDATE users SET balance = balance + 1 WHERE user_id=?", (receiver.id,))
     db.commit()
 
-    await add_history(sender.id, receiver.id, 1, "transfer")
+    add_history(sender.id, receiver.id, 1, "transfer")
 
     await message.reply(
         "🪙 <b>Ладушка передана!</b>\n\n"
@@ -358,11 +372,11 @@ async def add_balance(message: Message):
         return
 
     user = message.reply_to_message.from_user
-    await register_user(user)
+    register_user(user)
     cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user.id))
     db.commit()
 
-    await add_history(ADMIN_ID, user.id, amount, "add")
+    add_history(ADMIN_ID, user.id, amount, "add")
     await message.answer(f"✅ {user.full_name} получил {amount} ладушек.")
 
 
@@ -382,7 +396,7 @@ async def remove_balance(message: Message):
     cursor.execute("UPDATE users SET balance = MAX(balance-?,0) WHERE user_id=?", (amount, user.id))
     db.commit()
 
-    await add_history(ADMIN_ID, user.id, amount, "remove")
+    add_history(ADMIN_ID, user.id, amount, "remove")
     await message.answer("✅ Ладушки сняты.")
 
 
@@ -401,7 +415,7 @@ async def set_balance(message: Message):
     user = message.reply_to_message.from_user
     cursor.execute("UPDATE users SET balance=? WHERE user_id=?", (amount, user.id))
     db.commit()
-    await upload_database_to_github()
+    trigger_github_upload()
 
     await message.answer("✅ Баланс изменён.")
 
@@ -421,7 +435,7 @@ async def fine(message: Message):
     user = message.reply_to_message.from_user
     cursor.execute("UPDATE users SET balance = MAX(balance-?,0) WHERE user_id=?", (amount, user.id))
     db.commit()
-    await upload_database_to_github()
+    trigger_github_upload()
 
     await message.answer(f"⚠️ Игрок {user.full_name} получил штраф {amount} ладушек.")
 
@@ -441,7 +455,7 @@ async def bonus(message: Message):
     user = message.reply_to_message.from_user
     cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user.id))
     db.commit()
-    await upload_database_to_github()
+    trigger_github_upload()
 
     await message.answer(f"🎁 Игрок {user.full_name} получил бонус {amount} ладушек.")
 
@@ -453,7 +467,7 @@ async def reset(message: Message):
     user = message.reply_to_message.from_user
     cursor.execute("UPDATE users SET balance=0 WHERE user_id=?", (user.id,))
     db.commit()
-    await upload_database_to_github()
+    trigger_github_upload()
 
     await message.answer("♻️ Баланс игрока сброшен.")
 
@@ -463,13 +477,6 @@ async def reset(message: Message):
 # ==========================
 
 async def on_startup(bot: Bot):
-    # 1. Скачиваем базу при запуске сервиса
-    await download_database_from_github()
-    
-    # 2. Инициализируем подключение к SQLite
-    init_db()
-    
-    # 3. Устанавливаем Webhook для приема сообщений
     await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
 
 
