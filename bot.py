@@ -1,425 +1,382 @@
 import os
 import time
 import base64
-import sqlite3
 import asyncio
+import logging
+import aiosqlite
 import aiohttp
 from aiohttp import web
 
-from aiogram import Bot, Dispatcher
-from aiogram.filters import Command
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
+logging.basicConfig(level=logging.INFO)
+
 # ==========================================
 # ⚙️ НАСТРОЙКИ (ENVIRONMENT VARIABLES)
 # ==========================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8529768374:AAFPcbC4fOtp_roH6k2fMHQ3UCOxtceY8DM")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "7837011810"))
-PING_URL = os.getenv("PING_URL", "https://iris-store-bot.onrender.com/")
-PORT = int(os.getenv("PORT", 8080))  # Порт для Render
+# ОБЯЗАТЕЛЬНО задайте эти переменные в панели Render / Environment!
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+PING_URL = os.getenv("PING_URL", "")
+PORT = int(os.getenv("PORT", 8080))
 
-# Файл базы данных SQLite
 DB_FILE = "ladushki.db"
 
-# Настройки интеграции с GitHub API
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_OWNER = os.getenv("GITHUB_OWNER", "")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
-
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{DB_FILE}"
 
+if not BOT_TOKEN:
+    logging.warning("⚠️ BOT_TOKEN не установлен в переменных окружения!")
+
 # ==========================================
-# 🌐 МИНИ ВЕБ-СЕРВЕР ДЛЯ RENDER (HEALTH CHECK)
+# 🌐 ВЕБ-СЕРВЕР ДЛЯ RENDER (HEALTH CHECK)
 # ==========================================
 async def handle_ping(request):
-    return web.Response(text="Bot is running!")
+    return web.Response(text="Bot is running!", status=200)
 
 async def start_web_server():
-    """Запускает простейший HTTP-сервер, чтобы Render видел открытый порт."""
     app = web.Application()
-    app.router.add_get("/", handle_ping)
-    app.router.add_get("/ping", handle_ping)
+    app.router.add_get('/', handle_ping)
+    app.router.add_get('/ping', handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    print(f"🌐 HTTP Веб-сервер запущен на порту {PORT}")
+    logging.info(f"🌐 Веб-сервер запущен на порту {PORT}")
 
 # ==========================================
-# 🗄️ БАЗА ДАННЫХ (SQLITE)
-# ==========================================
-def get_connection():
-    return sqlite3.connect(DB_FILE)
-
-
-def init_db():
-    """Инициализация расширенной структуры базы данных."""
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        
-        # Основная таблица пользователей
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            balance INTEGER DEFAULT 0,
-            experience INTEGER DEFAULT 0,
-            level INTEGER DEFAULT 1,
-            last_daily INTEGER DEFAULT 0,
-            last_active INTEGER DEFAULT 0
-        )
-        """)
-
-        # Таблица инвентаря
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS inventory (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            item_name TEXT,
-            quantity INTEGER DEFAULT 1,
-            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
-        )
-        """)
-
-        # Таблица достижений
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS achievements (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            achievement_name TEXT,
-            unlocked_at INTEGER,
-            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
-        )
-        """)
-
-        # Таблица настроек пользователя
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS user_settings (
-            user_id INTEGER PRIMARY KEY,
-            notifications_enabled INTEGER DEFAULT 1,
-            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
-        )
-        """)
-        
-        conn.commit()
-
-
-def update_user_activity(user_id: int, username: str):
-    """Обновляет или регистрирует пользователя при любом взаимодействии."""
-    now = int(time.time())
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR IGNORE INTO users(user_id, username, last_active) VALUES(?,?,?)",
-            (user_id, username, now)
-        )
-        cursor.execute(
-            "UPDATE users SET username=?, last_active=? WHERE user_id=?",
-            (username, now, user_id)
-        )
-        cursor.execute(
-            "INSERT OR IGNORE INTO user_settings(user_id) VALUES(?)",
-            (user_id,)
-        )
-        conn.commit()
-
-
-def get_user_balance(user_id: int) -> int:
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-        res = cursor.fetchone()
-        return res[0] if res else 0
-
-
-def update_balance(user_id: int, amount: int, mode: str = "add"):
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        if mode == "add":
-            cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user_id))
-        elif mode == "subtract":
-            cursor.execute("UPDATE users SET balance = MAX(balance - ?, 0) WHERE user_id=?", (amount, user_id))
-        conn.commit()
-
-
-def get_last_daily(user_id: int) -> int:
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT last_daily FROM users WHERE user_id=?", (user_id,))
-        res = cursor.fetchone()
-        return res[0] if res else 0
-
-
-def update_daily(user_id: int, now_time: int, reward: int = 25):
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE users SET balance = balance + ?, last_daily=? WHERE user_id=?",
-            (reward, now_time, user_id)
-        )
-        conn.commit()
-
-
-def get_top_users(limit: int = 10):
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT username, balance FROM users ORDER BY balance DESC LIMIT ?", (limit,))
-        return cursor.fetchall()
-
-# ==========================================
-# ☁️ СИНХРОНИЗАЦИЯ С GITHUB
+# 🔄 СИНХРОНИЗАЦИЯ С GITHUB
 # ==========================================
 async def download_db_from_github():
-    """Скачивает последнюю версию базы данных из GitHub при запуске."""
-    if not (GITHUB_TOKEN and GITHUB_OWNER and GITHUB_REPO):
-        print("⚠️ GitHub переменные не настроены. Синхронизация пропущена.")
+    if not all([GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO]):
+        logging.info("ℹ️ GitHub настройки не заданы, пропуск скачивания DB.")
         return
 
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"}
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.get(f"{GITHUB_API_URL}?ref={GITHUB_BRANCH}", headers=headers) as response:
-                if response.status == 200:
-                    data = await response.json()
+            async with session.get(GITHUB_API_URL, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
                     content = base64.b64decode(data['content'])
                     with open(DB_FILE, 'wb') as f:
                         f.write(content)
-                    print("✅ База данных успешно загружена из GitHub.")
-                elif response.status == 404:
-                    print("ℹ️ База данных не найдена в репозитории. Создается новая.")
+                    logging.info("✅ База данных успешно скачана из GitHub!")
                 else:
-                    print(f"⚠️ Ошибка загрузки базы с GitHub (Status {response.status})")
+                    logging.warning(f"⚠️ База данных не найдена на GitHub (статус: {resp.status}).")
         except Exception as e:
-            print(f"❌ Ошибка при скачивании файла из GitHub: {e}")
-
+            logging.error(f"❌ Ошибка при скачивании базы из GitHub: {e}")
 
 async def upload_db_to_github():
-    """Выгружает текущую базу данных в репозиторий GitHub."""
-    if not (GITHUB_TOKEN and GITHUB_OWNER and GITHUB_REPO):
+    if not all([GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO]):
         return
 
     if not os.path.exists(DB_FILE):
         return
 
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"}
+    try:
+        with open(DB_FILE, 'rb') as f:
+            content = base64.b64encode(f.read()).decode('utf-8')
 
-    with open(DB_FILE, 'rb') as f:
-        content_b64 = base64.b64encode(f.read()).decode('utf-8')
-
-    async with aiohttp.ClientSession() as session:
-        try:
+        async with aiohttp.ClientSession() as session:
             sha = None
-            async with session.get(f"{GITHUB_API_URL}?ref={GITHUB_BRANCH}", headers=headers) as response:
-                if response.status == 200:
-                    data = await response.json()
+            async with session.get(GITHUB_API_URL, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
                     sha = data['sha']
 
             payload = {
                 "message": "Auto-update database",
-                "content": content_b64,
+                "content": content,
                 "branch": GITHUB_BRANCH
             }
             if sha:
                 payload["sha"] = sha
 
-            async with session.put(GITHUB_API_URL, headers=headers, json=payload) as response:
-                if response.status in [200, 201]:
-                    print("☁️ База данных успешно синхронизирована с GitHub.")
+            async with session.put(GITHUB_API_URL, headers=headers, json=payload) as resp:
+                if resp.status in (200, 201):
+                    logging.info("✅ База данных успешно сохранена на GitHub!")
                 else:
-                    print(f"⚠️ Ошибка выгрузки базы в GitHub (Status {response.status})")
-        except Exception as e:
-            print(f"❌ Ошибка при отправке файла в GitHub: {e}")
+                    logging.error(f"❌ Ошибка сохранении базы на GitHub: {await resp.text()}")
+    except Exception as e:
+        logging.error(f"❌ Исключение при выгрузке в GitHub: {e}")
 
+# ==========================================
+# 🗄️ РАБОТА С БАЗОЙ ДАННЫХ (AIOSQLITE)
+# ==========================================
+async def init_db():
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                name TEXT,
+                balance INTEGER DEFAULT 0,
+                last_daily INTEGER DEFAULT 0,
+                daily_streak INTEGER DEFAULT 0,
+                last_active INTEGER DEFAULT 0,
+                experience INTEGER DEFAULT 0,
+                level INTEGER DEFAULT 1,
+                referrer_id INTEGER DEFAULT NULL
+            )
+        ''')
+        await db.commit()
 
-async def auto_github_sync_task():
-    """Каждые 5 минут отправляет копию БД на GitHub."""
+async def update_user_activity(user_id: int, name: str, referrer_id: int = None):
+    now = int(time.time())
+    async with aiosqlite.connect(DB_FILE) as db:
+        cursor = await db.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        if not row:
+            await db.execute(
+                "INSERT INTO users (user_id, name, last_active, referrer_id) VALUES (?, ?, ?, ?)",
+                (user_id, name, now, referrer_id)
+            )
+        else:
+            await db.execute(
+                "UPDATE users SET name = ?, last_active = ? WHERE user_id = ?",
+                (name, now, user_id)
+            )
+        await db.commit()
+
+async def get_user(user_id: int):
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            return await cursor.fetchone()
+
+async def update_balance(user_id: int, amount: int):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
+        await db.commit()
+
+async def update_daily(user_id: int, now_ts: int, streak: int, reward: int):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "UPDATE users SET balance = balance + ?, last_daily = ?, daily_streak = ? WHERE user_id = ?",
+            (reward, now_ts, streak, user_id)
+        )
+        await db.commit()
+
+async def get_top_users(limit: int = 10):
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT name, balance, user_id FROM users ORDER BY balance DESC LIMIT ?", 
+            (limit,)
+        ) as cursor:
+            return await cursor.fetchall()
+
+async def get_user_rank(user_id: int):
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT COUNT(*) + 1 FROM users WHERE balance > (SELECT balance FROM users WHERE user_id = ?)",
+            (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else "N/A"
+
+# ==========================================
+# ⏰ ФОНОВЫЕ ЗАДАЧИ
+# ==========================================
+async def background_tasks():
     while True:
-        await asyncio.sleep(300)
+        await asyncio.sleep(180)  # Каждые 3 минуты
+        # Авто-пинг Render для предотвращения спящего режима
+        if PING_URL:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    await session.get(PING_URL)
+            except Exception as e:
+                logging.error(f" Ошибка self-ping: {e}")
+        
+        # Сохранение базы в GitHub
         await upload_db_to_github()
 
 # ==========================================
-# 🔄 ОБСЛУЖИВАНИЕ И АВТОПИНГ
+# 🤖 ИНИЦИАЛИЗА БОТА И ХЕНДЛЕРЫ
 # ==========================================
-async def auto_ping_task():
-    """Фоновый пинг для предотвращения засыпания сервера Render."""
-    if not PING_URL:
-        return
-
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                async with session.get(PING_URL, timeout=10) as response:
-                    print(f"Ping OK: {response.status}")
-            except Exception as e:
-                print("Ping error:", e)
-            await asyncio.sleep(300)
-
-
-async def auto_clean_db_task():
-    """Автоочистка пользователей без активности более 180 дней и с нулевым балансом."""
-    while True:
-        try:
-            now = int(time.time())
-            max_inactivity = 180 * 86400  # 180 дней в секундах
-
-            with get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                DELETE FROM users 
-                WHERE balance = 0 AND (?-last_active > ? OR last_active = 0)
-                """, (now, max_inactivity))
-                conn.commit()
-
-                cursor.execute("VACUUM")
-                conn.commit()
-
-            print("🧹 Очистка неактивных пользователей (>180 дней) и VACUUM выполнены.")
-        except Exception as e:
-            print("Ошибка при автоматической очистке БД:", e)
-
-        await asyncio.sleep(86400)
-
-# ==========================================
-# 🤖 ИНИЦИАЛИЗАЦИЯ И ХЭНДЛЕРЫ БОТА
-# ==========================================
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-
 @dp.message(Command("start"))
-async def start(message: Message):
-    update_user_activity(message.from_user.id, message.from_user.full_name)
-    await message.answer("👏 Добро пожаловать в систему Ладушек!")
+async def start_cmd(message: Message, command: CommandObject):
+    referrer_id = None
+    if command.args and command.args.isdigit():
+        ref = int(command.args)
+        if ref != message.from_user.id:
+            referrer_id = ref
 
-
-@dp.message(Command("баланс"))
-async def balance(message: Message):
-    update_user_activity(message.from_user.id, message.from_user.full_name)
-    user_balance = get_user_balance(message.from_user.id)
-    await message.answer(f"👏 Ваш баланс: <b>{user_balance}</b> ладушек")
-
-
-@dp.message(Command("выдать"))
-async def give(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    args = message.text.split()
-    if len(args) != 3 or not args[1].isdigit() or not args[2].isdigit():
-        await message.answer("Пример: /выдать 123456789 100")
-        return
-
-    user_id = int(args[1])
-    amount = int(args[2])
-
-    update_user_activity(user_id, "Пользователь")
-    update_balance(user_id, amount, mode="add")
-
-    await message.answer(f"✅ Выдано {amount} ладушек")
-
-
-@dp.message(Command("забрать"))
-async def take(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    args = message.text.split()
-    if len(args) != 3 or not args[1].isdigit() or not args[2].isdigit():
-        await message.answer("Пример: /забрать 123456789 100")
-        return
-
-    user_id = int(args[1])
-    amount = int(args[2])
-
-    update_balance(user_id, amount, mode="subtract")
-
-    await message.answer(f"❌ Забрано {amount} ладушек")
-
-
-@dp.message(Command("штраф"))
-async def fine(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    args = message.text.split()
-    if len(args) < 4 or not args[1].isdigit() or not args[2].isdigit():
-        await message.answer("Пример: /штраф 123456789 20 Опоздал")
-        return
-
-    user_id = int(args[1])
-    amount = int(args[2])
-    reason = " ".join(args[3:])
-
-    update_balance(user_id, amount, mode="subtract")
-
-    await message.answer(
-        f"🚨 Штраф\n\n"
-        f"➖ {amount} ладушек\n"
-        f"📝 Причина: {reason}"
+    await update_user_activity(message.from_user.id, message.from_user.full_name, referrer_id)
+    
+    welcome_text = (
+        f"Привет, <b>{message.from_user.first_name}</b>! 👋\n\n"
+        "Добро пожаловать в бота **Ладушки**! 🎉\n\n"
+        "📜 <b>Доступные команды:</b>\n"
+        "🔹 `/профиль` — Ваш баланс и статистика\n"
+        "🔹 `/ежедневка` — Забрать ежедневный бонус\n"
+        "🔹 `/топ` — Таблица лидеров по ладушкам\n"
+        "🔹 `/передать <id> <кол-во>` — Перевести ладушки"
     )
+    await message.answer(welcome_text)
 
+@dp.message(Command("профиль"))
+async def profile_cmd(message: Message):
+    await update_user_activity(message.from_user.id, message.from_user.full_name)
+    user = await get_user(message.from_user.id)
+    
+    if not user:
+        await message.answer("Профиль не найден.")
+        return
+
+    rank = await get_user_rank(message.from_user.id)
+
+    text = (
+        f"👤 <b>Профиль: {user['name']}</b>\n\n"
+        f"👏 <b>Баланс:</b> {user['balance']} ладушек\n"
+        f"🏆 <b>Место в топе:</b> #{rank}\n"
+        f"🔥 <b>Стрик ежедневок:</b> {user['daily_streak']} дн.\n"
+        f"⭐ <b>Уровень:</b> {user['level']}\n"
+    )
+    await message.answer(text)
 
 @dp.message(Command("ежедневка"))
-async def daily(message: Message):
-    update_user_activity(message.from_user.id, message.from_user.full_name)
-
-    last = get_last_daily(message.from_user.id)
+async def daily_cmd(message: Message):
+    await update_user_activity(message.from_user.id, message.from_user.full_name)
+    user = await get_user(message.from_user.id)
+    
     now = int(time.time())
+    last = user['last_daily']
+    elapsed = now - last
 
-    if now - last < 86400:
-        await message.answer("⏰ Ежедневка уже получена")
+    if elapsed < 86400:
+        remaining = 86400 - elapsed
+        hours = remaining // 3600
+        minutes = (remaining % 3600) // 60
+        await message.answer(f"⏰ Вы уже получали бонус! Возвращайтесь через **{hours}ч {minutes}мин**.")
         return
 
-    update_daily(message.from_user.id, now, reward=25)
-    await message.answer("🎁 Вы получили 25 ладушек!")
+    # Подсчет стрика (сброс если прошло более 48 часов)
+    streak = user['daily_streak'] + 1 if elapsed < 172800 else 1
+    reward = 25 + min(streak * 5, 50)  # Награда растет с каждым днем (+5 за день, максимум +50)
 
+    await update_daily(message.from_user.id, now, streak, reward)
+    
+    await message.answer(
+        f"🎁 Вы получили <b>{reward}</b> ладушек!\n"
+        f"🔥 Серия дней подряд: <b>{streak}</b>"
+    )
 
 @dp.message(Command("топ"))
-async def top(message: Message):
-    update_user_activity(message.from_user.id, message.from_user.full_name)
+async def top_cmd(message: Message):
+    await update_user_activity(message.from_user.id, message.from_user.full_name)
+    users = await get_top_users(limit=10)
 
-    users = get_top_users(limit=10)
-
-    text = "🏆 ТОП ЛАДУШЕК\n\n"
+    medals = ["🥇", "🥈", "🥉"]
+    text = "🏆 <b>ТОП-10 ПО ЛАДУШКАМ</b>\n\n"
+    
     for place, user in enumerate(users, start=1):
-        text += f"{place}. {user[0]} — {user[1]} 👏\n"
+        icon = medals[place - 1] if place <= 3 else f"<b>{place}.</b>"
+        text += f"{icon} {user[0]} — <b>{user[1]}</b> 👏\n"
+
+    user_rank = await get_user_rank(message.from_user.id)
+    text += f"\n🎯 Ваша позиция в рейтинге: <b>#{user_rank}</b>"
 
     await message.answer(text)
+
+@dp.message(Command("передать"))
+async def transfer_cmd(message: Message, command: CommandObject):
+    await update_user_activity(message.from_user.id, message.from_user.full_name)
+    
+    if not command.args or len(command.args.split()) < 2:
+        await message.answer("⚠️ Использование: `/передать <user_id> <сумма>`")
+        return
+
+    args = command.args.split()
+    if not args[0].isdigit() or not args[1].isdigit():
+        await message.answer("⚠️ Укажите корректный ID и числовое значение суммы.")
+        return
+
+    target_id = int(args[0])
+    amount = int(args[1])
+
+    if amount <= 0:
+        await message.answer("⚠️ Сумма перевода должна быть больше 0.")
+        return
+
+    sender = await get_user(message.from_user.id)
+    if sender['balance'] < amount:
+        await message.answer("❌ У вас недостаточно ладушек на балансе.")
+        return
+
+    target = await get_user(target_id)
+    if not target:
+        await message.answer("❌ Получатель не найден в базе бота.")
+        return
+
+    await update_balance(message.from_user.id, -amount)
+    await update_balance(target_id, amount)
+
+    await message.answer(f"✅ Вы успешно перевели <b>{amount}</b> ладушек пользователю <b>{target['name']}</b>!")
+
+# ==========================================
+# 👑 АДМИН КОМАНДЫ
+# ==========================================
+@dp.message(Command("выдать"))
+async def give_cmd(message: Message, command: CommandObject):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    args = command.args.split() if command.args else []
+    if len(args) < 2 or not args[0].isdigit() or not args[1].isdigit():
+        await message.answer("⚠️ Использование: `/выдать <user_id> <сумма>`")
+        return
+
+    target_id = int(args[0])
+    amount = int(args[1])
+    
+    await update_balance(target_id, amount)
+    await message.answer(f"✅ Начислено {amount} ладушек пользователю ID {target_id}")
+
+@dp.message(Command("штраф"))
+async def penalty_cmd(message: Message, command: CommandObject):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    args = command.args.split() if command.args else []
+    if len(args) < 2 or not args[0].isdigit() or not args[1].isdigit():
+        await message.answer("⚠️ Использование: `/штраф <user_id> <сумма>`")
+        return
+
+    target_id = int(args[0])
+    amount = int(args[1])
+    
+    await update_balance(target_id, -amount)
+    await message.answer(f"✅ Списано {amount} ладушек у пользователя ID {target_id}")
 
 # ==========================================
 # 🚀 ТОЧКА ВХОДА
 # ==========================================
 async def main():
-    # 1. Запуск веб-сервера для прохождения проверки порта на Render
     await start_web_server()
-
-    # 2. Скачиваем актуальную версию SQLite из GitHub при старте
     await download_db_from_github()
+    await init_db()
 
-    # 3. Инициализируем локальную структуру таблиц
-    init_db()
+    asyncio.create_task(background_tasks())
 
-    # 4. Запускаем фоновые задачи
-    asyncio.create_task(auto_ping_task())
-    asyncio.create_task(auto_clean_db_task())
-    asyncio.create_task(auto_github_sync_task())
-
-    # 5. Запускаем бота
-    await dp.start_polling(bot)
-
+    try:
+        logging.info("🚀 Бот запущен!")
+        await dp.start_polling(bot)
+    finally:
+        logging.info("⏳ Сохранение данных перед выключением...")
+        await upload_db_to_github()
+        await bot.session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
