@@ -1,3 +1,4 @@
+import os
 import asyncio
 import sqlite3
 from datetime import datetime
@@ -7,14 +8,22 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.client.default import DefaultBotProperties
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 
 # ==========================
-# НАСТРОЙКИ
+# НАСТРОЙКИ (Переменные окружения)
 # ==========================
 
-TOKEN = "8529768374:AAHUF34sL8NygJousF46asP-FU9-H1U_Oac"
+TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "7837011810"))
 
-ADMIN_ID = 7837011810
+# Render автоматически передает PORT. Если локально — по умолчанию 8080.
+PORT = int(os.getenv("PORT", 8080))
+# URL вашего сервиса на Render (например, https://my-bot.onrender.com)
+WEBHOOK_HOST = os.getenv("WEBHOOK_URL")
+WEBHOOK_PATH = f"/webhook/{TOKEN}"
+WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
 bot = Bot(
     token=TOKEN,
@@ -27,7 +36,7 @@ dp = Dispatcher()
 # БАЗА ДАННЫХ
 # ==========================
 
-db = sqlite3.connect("ladushki.db")
+db = sqlite3.connect("ladushki.db", check_same_thread=False)
 cursor = db.cursor()
 
 cursor.execute("""
@@ -55,7 +64,7 @@ db.commit()
 
 
 # ==========================
-# ФУНКЦИИ
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==========================
 
 def register_user(user):
@@ -64,11 +73,7 @@ def register_user(user):
         INSERT OR IGNORE INTO users(user_id, username, full_name, balance)
         VALUES(?,?,?,0)
         """,
-        (
-            user.id,
-            user.username,
-            user.full_name
-        )
+        (user.id, user.username, user.full_name)
     )
 
     cursor.execute(
@@ -77,28 +82,15 @@ def register_user(user):
         SET username=?, full_name=?
         WHERE user_id=?
         """,
-        (
-            user.username,
-            user.full_name,
-            user.id
-        )
+        (user.username, user.full_name, user.id)
     )
-
     db.commit()
 
 
 def get_balance(user_id):
-    cursor.execute(
-        "SELECT balance FROM users WHERE user_id=?",
-        (user_id,)
-    )
-
+    cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
     row = cursor.fetchone()
-
-    if row:
-        return row[0]
-
-    return 0
+    return row[0] if row else 0
 
 
 def profile_link(user):
@@ -106,50 +98,6 @@ def profile_link(user):
         return f"https://t.me/{user.username}"
     return f"tg://user?id={user.id}"
 
-
-# ==========================
-# START
-# ==========================
-
-@dp.message(Command("start"))
-async def start(message: Message):
-    register_user(message.from_user)
-
-    await message.answer(
-        "👋 Добро пожаловать!\n\n"
-        "Это бот группы <b>Ладушки</b>.\n\n"
-        "Напиши <b>баланс</b>, чтобы посмотреть свои ладушки."
-    )
-
-
-# ==========================
-# БАЛАНС
-# ==========================
-
-@dp.message(F.text.lower() == "баланс")
-async def balance(message: Message):
-
-    register_user(message.from_user)
-
-    target = message.from_user
-
-    if message.reply_to_message:
-        target = message.reply_to_message.from_user
-        register_user(target)
-
-    balance = get_balance(target.id)
-
-    text = (
-        f"👤 <b>{target.full_name}</b>\n\n"
-        f"🔗 {profile_link(target)}\n\n"
-        f"🪙 Ладушки: <b>{balance}</b>"
-    )
-
-    await message.answer(text)
-
-# ==========================
-# ПЕРЕДАЧА ЛАДУШЕК
-# ==========================
 
 def add_history(sender, receiver, amount, action, reason=""):
     cursor.execute(
@@ -169,9 +117,46 @@ def add_history(sender, receiver, amount, action, reason=""):
     db.commit()
 
 
+def is_admin(user_id: int):
+    return user_id == ADMIN_ID
+
+
+# ==========================
+# ХЕНДЛЕРЫ
+# ==========================
+
+@dp.message(Command("start"))
+async def start(message: Message):
+    register_user(message.from_user)
+    await message.answer(
+        "👋 Добро пожаловать!\n\n"
+        "Это бот группы <b>Ладушки</b>.\n\n"
+        "Напиши <b>баланс</b>, чтобы посмотреть свои ладушки."
+    )
+
+
+@dp.message(F.text.lower() == "баланс")
+async def balance(message: Message):
+    register_user(message.from_user)
+    target = message.from_user
+
+    if message.reply_to_message:
+        target = message.reply_to_message.from_user
+        register_user(target)
+
+    user_balance = get_balance(target.id)
+
+    text = (
+        f"👤 <b>{target.full_name}</b>\n\n"
+        f"🔗 {profile_link(target)}\n\n"
+        f"🪙 Ладушки: <b>{user_balance}</b>"
+    )
+
+    await message.answer(text)
+
+
 @dp.message(F.text.lower() == "ладушка")
 async def transfer_ladushka(message: Message):
-
     if not message.reply_to_message:
         return
 
@@ -191,24 +176,11 @@ async def transfer_ladushka(message: Message):
         await message.reply("❌ У вас нет ладушек.")
         return
 
-    cursor.execute(
-        "UPDATE users SET balance = balance - 1 WHERE user_id=?",
-        (sender.id,)
-    )
-
-    cursor.execute(
-        "UPDATE users SET balance = balance + 1 WHERE user_id=?",
-        (receiver.id,)
-    )
-
+    cursor.execute("UPDATE users SET balance = balance - 1 WHERE user_id=?", (sender.id,))
+    cursor.execute("UPDATE users SET balance = balance + 1 WHERE user_id=?", (receiver.id,))
     db.commit()
 
-    add_history(
-        sender.id,
-        receiver.id,
-        1,
-        "transfer"
-    )
+    add_history(sender.id, receiver.id, 1, "transfer")
 
     await message.reply(
         "🪙 <b>Ладушка передана!</b>\n\n"
@@ -219,20 +191,14 @@ async def transfer_ladushka(message: Message):
     )
 
 
-# ==========================
-# ТОП
-# ==========================
-
 @dp.message(Command("top"))
 async def top_players(message: Message):
-
     cursor.execute("""
         SELECT full_name, balance
         FROM users
         ORDER BY balance DESC
         LIMIT 10
     """)
-
     rows = cursor.fetchall()
 
     if not rows:
@@ -240,261 +206,159 @@ async def top_players(message: Message):
         return
 
     text = "🏆 <b>ТОП игроков</b>\n\n"
-
     for i, row in enumerate(rows, start=1):
         text += f"{i}. {row[0]} — 🪙 {row[1]}\n"
 
     await message.answer(text)
 
 
-# ==========================
-# ИСТОРИЯ
-# ==========================
-
 @dp.message(Command("history"))
 async def history(message: Message):
-
     cursor.execute("""
         SELECT action, amount, date
         FROM history
         WHERE sender=? OR receiver=?
         ORDER BY id DESC
         LIMIT 10
-    """, (
-        message.from_user.id,
-        message.from_user.id
-    ))
+    """, (message.from_user.id, message.from_user.id))
 
     rows = cursor.fetchall()
-
     if not rows:
         await message.answer("📜 История пуста.")
         return
 
     text = "📜 <b>Последние операции</b>\n\n"
-
     for action, amount, date in rows:
         text += f"• {action} | {amount} 🪙 | {date}\n"
 
     await message.answer(text)
 
-# ==========================
-# ПРОВЕРКА АДМИНА
-# ==========================
 
-def is_admin(user_id: int):
-    return user_id == ADMIN_ID
-
-
-# ==========================
-# /add
-# ==========================
+# --- Админские команды ---
 
 @dp.message(Command("add"))
 async def add_balance(message: Message):
-
-    if not is_admin(message.from_user.id):
+    if not is_admin(message.from_user.id) or not message.reply_to_message:
         return
-
-    if not message.reply_to_message:
-        await message.answer("Ответьте на сообщение игрока.")
-        return
-
     args = message.text.split()
-
     if len(args) != 2:
-        await message.answer("Использование:\n/add 10")
+        await message.answer("Использование: /add 10")
         return
-
     try:
         amount = int(args[1])
-    except:
+    except ValueError:
         await message.answer("Введите число.")
         return
 
     user = message.reply_to_message.from_user
-
     register_user(user)
-
-    cursor.execute(
-        "UPDATE users SET balance = balance + ? WHERE user_id=?",
-        (amount, user.id)
-    )
+    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user.id))
     db.commit()
-
     add_history(ADMIN_ID, user.id, amount, "add")
-
     await message.answer(f"✅ {user.full_name} получил {amount} ладушек.")
 
 
-# ==========================
-# /remove
-# ==========================
-
 @dp.message(Command("remove"))
 async def remove_balance(message: Message):
-
-    if not is_admin(message.from_user.id):
+    if not is_admin(message.from_user.id) or not message.reply_to_message:
         return
-
-    if not message.reply_to_message:
-        await message.answer("Ответьте на сообщение игрока.")
-        return
-
     args = message.text.split()
-
     if len(args) != 2:
-        await message.answer("Использование:\n/remove 10")
         return
-
-    amount = int(args[1])
+    try:
+        amount = int(args[1])
+    except ValueError:
+        return
 
     user = message.reply_to_message.from_user
-
-    cursor.execute(
-        "UPDATE users SET balance = MAX(balance-?,0) WHERE user_id=?",
-        (amount, user.id)
-    )
-
+    cursor.execute("UPDATE users SET balance = MAX(balance-?,0) WHERE user_id=?", (amount, user.id))
     db.commit()
-
     add_history(ADMIN_ID, user.id, amount, "remove")
-
     await message.answer("✅ Ладушки сняты.")
 
 
-# ==========================
-# /set
-# ==========================
-
 @dp.message(Command("set"))
 async def set_balance(message: Message):
-
-    if not is_admin(message.from_user.id):
+    if not is_admin(message.from_user.id) or not message.reply_to_message:
         return
-
-    if not message.reply_to_message:
-        return
-
     args = message.text.split()
-
     if len(args) != 2:
         return
-
     amount = int(args[1])
-
     user = message.reply_to_message.from_user
-
-    cursor.execute(
-        "UPDATE users SET balance=? WHERE user_id=?",
-        (amount, user.id)
-    )
-
+    cursor.execute("UPDATE users SET balance=? WHERE user_id=?", (amount, user.id))
     db.commit()
-
     await message.answer("✅ Баланс изменён.")
 
 
-# ==========================
-# /fine
-# ==========================
-
 @dp.message(Command("fine"))
 async def fine(message: Message):
-
-    if not is_admin(message.from_user.id):
+    if not is_admin(message.from_user.id) or not message.reply_to_message:
         return
-
-    if not message.reply_to_message:
-        return
-
     args = message.text.split()
-
     if len(args) < 2:
         return
-
     amount = int(args[1])
-
     user = message.reply_to_message.from_user
-
-    cursor.execute(
-        "UPDATE users SET balance = MAX(balance-?,0) WHERE user_id=?",
-        (amount, user.id)
-    )
-
+    cursor.execute("UPDATE users SET balance = MAX(balance-?,0) WHERE user_id=?", (amount, user.id))
     db.commit()
+    await message.answer(f"⚠️ Игрок {user.full_name} получил штраф {amount} ладушек.")
 
-    await message.answer(
-        f"⚠️ Игрок {user.full_name} получил штраф {amount} ладушек."
-    )
-
-
-# ==========================
-# /bonus
-# ==========================
 
 @dp.message(Command("bonus"))
 async def bonus(message: Message):
-
-    if not is_admin(message.from_user.id):
+    if not is_admin(message.from_user.id) or not message.reply_to_message:
         return
-
-    if not message.reply_to_message:
-        return
-
     args = message.text.split()
-
     if len(args) < 2:
         return
-
     amount = int(args[1])
-
     user = message.reply_to_message.from_user
-
-    cursor.execute(
-        "UPDATE users SET balance = balance + ? WHERE user_id=?",
-        (amount, user.id)
-    )
-
+    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user.id))
     db.commit()
+    await message.answer(f"🎁 Игрок {user.full_name} получил бонус {amount} ладушек.")
 
-    await message.answer(
-        f"🎁 Игрок {user.full_name} получил бонус {amount} ладушек."
-    )
-
-
-# ==========================
-# /reset
-# ==========================
 
 @dp.message(Command("reset"))
 async def reset(message: Message):
-
-    if not is_admin(message.from_user.id):
+    if not is_admin(message.from_user.id) or not message.reply_to_message:
         return
-
-    if not message.reply_to_message:
-        return
-
     user = message.reply_to_message.from_user
-
-    cursor.execute(
-        "UPDATE users SET balance=0 WHERE user_id=?",
-        (user.id,)
-    )
-
+    cursor.execute("UPDATE users SET balance=0 WHERE user_id=?", (user.id,))
     db.commit()
-
     await message.answer("♻️ Баланс игрока сброшен.")
 
 
 # ==========================
-# ЗАПУСК
+# WEBHOOK & AIOHTTP SETUP
 # ==========================
 
-async def main():
-    print("Бот запущен.")
-    await dp.start_polling(bot)
+async def on_startup(bot: Bot):
+    # Автоматически ставим вебхук при запуске сервера
+    await bot.set_webhook(WEBHOOK_URL)
+
+async def on_shutdown(bot: Bot):
+    # Снимаем вебхук и закрываем БД при остановке
+    await bot.delete_webhook()
+    db.close()
+
+def main():
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+
+    app = web.Application()
+
+    # Связываем aiogram handler с aiohttp
+    webhook_requests_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+    )
+    webhook_requests_handler.register(app, path=WEBHOOK_PATH)
+
+    setup_application(app, dp, bot=bot)
+
+    # Запускаем aiohttp сервер на порту, требуемом Render
+    web.run_app(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
