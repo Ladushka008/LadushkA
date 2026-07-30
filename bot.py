@@ -302,6 +302,9 @@ async def get_daily_bonus(message: Message):
     )
     db.commit()
 
+    # Мгновенно выгружаем обновившуюся БД на GitHub
+    trigger_github_upload()
+
     add_history(0, user.id, reward, "daily_bonus")
 
     await message.reply(
