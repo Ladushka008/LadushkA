@@ -10,8 +10,6 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.client.default import DefaultBotProperties
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-from aiohttp import web
 
 # ==========================
 # НАСТРОЙКИ (Переменные окружения)
@@ -19,7 +17,6 @@ from aiohttp import web
 
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7837011810"))
-PORT = int(os.getenv("PORT", 8080))
 
 # GitHub настройки
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
@@ -28,11 +25,8 @@ DB_FILE = "database.db"
 GITHUB_FILE_PATH = "database.db"
 BRANCH = "main"
 
-raw_url = (os.getenv("WEBHOOK_URL") or "").strip()
-WEBHOOK_HOST = raw_url.removesuffix("/").removesuffix("/webhook").removesuffix("/")
-
-WEBHOOK_PATH = f"/webhook/{TOKEN}"
-WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
+if not TOKEN:
+    print("CRITICAL ERROR: BOT_TOKEN is missing!")
 
 bot = Bot(
     token=TOKEN,
@@ -40,20 +34,17 @@ bot = Bot(
 )
 
 dp = Dispatcher()
-
-# Инициализируем глобальные переменные БД
 db = None
 cursor = None
 
 
 # ==========================
-# GITHUB СИНХРОНИЗАЦИЯ (REST API)
+# GITHUB СИНХРОНИЗАЦИЯ
 # ==========================
 
 def _sync_download():
-    """Синхронное скачивание базы из GitHub"""
     if not GITHUB_TOKEN or not GITHUB_REPO:
-        print("GitHub sync failed")
+        print("GitHub sync failed: GITHUB_TOKEN or GITHUB_REPO missing")
         return False
 
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
@@ -72,21 +63,20 @@ def _sync_download():
             print("Database downloaded from GitHub")
             return True
         else:
-            print("GitHub sync failed")
+            print(f"GitHub sync failed: Status {response.status_code}")
             return False
-    except Exception:
-        print("GitHub sync failed")
+    except Exception as e:
+        print(f"GitHub sync failed: {e}")
         return False
 
 
 def _sync_upload():
-    """Синхронная отправка базы в GitHub"""
     if not GITHUB_TOKEN or not GITHUB_REPO:
-        print("GitHub sync failed")
+        print("GitHub sync failed: GITHUB_TOKEN or GITHUB_REPO missing")
         return False
 
     if not os.path.exists(DB_FILE):
-        print("GitHub sync failed")
+        print("GitHub sync failed: File DB not found")
         return False
 
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
@@ -118,29 +108,15 @@ def _sync_upload():
             print("Database uploaded to GitHub")
             return True
         else:
-            print("GitHub sync failed")
+            print(f"GitHub sync failed: Status {put_resp.status_code}")
             return False
-    except Exception:
-        print("GitHub sync failed")
+    except Exception as e:
+        print(f"GitHub sync failed: {e}")
         return False
 
 
-def download_database_from_github():
-    if not os.path.exists(DB_FILE):
-        _sync_download()
-
-
-async def upload_database_to_github():
-    """Запуск выгрузки в отдельном потоке"""
-    try:
-        await asyncio.to_thread(_sync_upload)
-    except Exception:
-        print("GitHub sync failed")
-
-
 def trigger_github_upload():
-    """Запуск выгрузки в фоновом режиме, чтобы не задерживать ответ в Telegram"""
-    asyncio.create_task(upload_database_to_github())
+    asyncio.create_task(asyncio.to_thread(_sync_upload))
 
 
 # ==========================
@@ -149,7 +125,8 @@ def trigger_github_upload():
 
 def init_db():
     global db, cursor
-    download_database_from_github()
+    if not os.path.exists(DB_FILE):
+        _sync_download()
 
     db = sqlite3.connect(DB_FILE, check_same_thread=False)
     cursor = db.cursor()
@@ -178,7 +155,6 @@ def init_db():
     db.commit()
 
 
-# Инициализируем БД при импорте модуля
 init_db()
 
 
@@ -473,35 +449,14 @@ async def reset(message: Message):
 
 
 # ==========================
-# WEBHOOK & AIOHTTP SETUP
+# ЗАПУСК ЧЕРЕЗ POLLING
 # ==========================
 
-async def on_startup(bot: Bot):
-    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
-
-
-async def on_shutdown(bot: Bot):
-    await bot.delete_webhook()
-    if db:
-        db.close()
-
-
-def main():
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
-
-    app = web.Application()
-
-    webhook_requests_handler = SimpleRequestHandler(
-        dispatcher=dp,
-        bot=bot,
-    )
-    webhook_requests_handler.register(app, path=WEBHOOK_PATH)
-
-    setup_application(app, dp, bot=bot)
-
-    web.run_app(app, host="0.0.0.0", port=PORT)
-
+async def main():
+    print("Удаляем старый Webhook...")
+    await bot.delete_webhook(drop_pending_updates=True)
+    print("Бот успешно запущен и ожидает сообщений!")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
