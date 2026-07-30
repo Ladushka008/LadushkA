@@ -164,6 +164,16 @@ def init_db():
     )
     """)
 
+    # Таблица для инвентаря
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS inventory(
+        user_id INTEGER,
+        item_name TEXT,
+        quantity INTEGER DEFAULT 0,
+        PRIMARY KEY (user_id, item_name)
+    )
+    """)
+
     db.commit()
 
 
@@ -233,6 +243,33 @@ def is_admin(user_id: int):
     return user_id == ADMIN_ID
 
 
+# Функции для работы с инвентарём
+def get_item_quantity(user_id, item_name):
+    cursor.execute("SELECT quantity FROM inventory WHERE user_id=? AND item_name=?", (user_id, item_name))
+    row = cursor.fetchone()
+    return row[0] if row else 0
+
+
+def add_item(user_id, item_name, count=1):
+    cursor.execute("""
+        INSERT INTO inventory (user_id, item_name, quantity)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id, item_name) DO UPDATE SET quantity = quantity + ?
+    """, (user_id, item_name, count, count))
+    db.commit()
+    trigger_github_upload()
+
+
+def remove_item(user_id, item_name, count=1):
+    current = get_item_quantity(user_id, item_name)
+    if current <= count:
+        cursor.execute("DELETE FROM inventory WHERE user_id=? AND item_name=?", (user_id, item_name))
+    else:
+        cursor.execute("UPDATE inventory SET quantity = quantity - ? WHERE user_id=? AND item_name=?", (count, user_id, item_name))
+    db.commit()
+    trigger_github_upload()
+
+
 # ==========================
 # ХЕНДЛЕРЫ
 # ==========================
@@ -245,7 +282,10 @@ async def start(message: Message):
         "💬 <b>Команды:</b>\n"
         "• Напишите <b>баланс</b> — чтобы узнать счет.\n"
         "• Напишите <b>бонус</b> — чтобы получить ежедневный бонус.\n"
-        "• Ответьте на сообщение текстом <b>дать 50</b> — чтобы перевести ладушки."
+        "• Напишите <b>магазин</b> — чтобы открыть магазин предметов.\n"
+        "• Напишите <b>инвентарь</b> — чтобы посмотреть свои предметы.\n"
+        "• Ответьте на сообщение текстом <b>дать 50</b> — чтобы перевести ладушки.\n"
+        "• Ответьте на сообщение текстом <b>ударить ладушкой</b> — применить Боевую ладушку."
     )
 
 
@@ -302,7 +342,6 @@ async def get_daily_bonus(message: Message):
     )
     db.commit()
 
-    # Мгновенно выгружаем обновившуюся БД на GitHub
     trigger_github_upload()
 
     add_history(0, user.id, reward, "daily_bonus")
@@ -312,6 +351,109 @@ async def get_daily_bonus(message: Message):
         f"💰 Ты получил: <b>+{reward}</b> ладушки"
     )
 
+
+# --- МАГАЗИН И ИНВЕНТАРЬ ---
+
+@dp.message(F.text.lower() == "магазин")
+async def shop_handler(message: Message):
+    text = (
+        "🛒 <b>Магазин Ладушек</b>\n\n"
+        "🥊 <b>Боевая ладушка</b> — 200 ладушек\n\n"
+        "Для покупки:\n"
+        "<code>купить ладушка</code>"
+    )
+    await message.answer(text)
+
+
+@dp.message(F.text.lower() == "купить ладушка")
+async def buy_battle_ladushka(message: Message):
+    user = message.from_user
+    register_user(user)
+    
+    price = 200
+    user_bal = get_balance(user.id)
+
+    if user_bal < price:
+        await message.reply(
+            f"❌ <b>Недостаточно ладушек.</b>\n\n"
+            f"Ваш баланс: <b>{user_bal}</b> ладушек"
+        )
+        return
+
+    # Списываем средства и добавляем предмет
+    cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (price, user.id))
+    db.commit()
+    
+    add_item(user.id, "battle_ladushka", 1)
+    add_history(user.id, 0, price, "buy_item", "Боевая ладушка")
+
+    await message.reply(
+        "✅ <b>Покупка успешна!</b>\n\n"
+        "🥊 <b>Получено:</b> Боевая ладушка ×1\n"
+        f"💰 <b>Списано:</b> {price} ладушек"
+    )
+
+
+@dp.message(F.text.lower() == "инвентарь")
+async def inventory_handler(message: Message):
+    user = message.from_user
+    register_user(user)
+
+    cursor.execute("SELECT item_name, quantity FROM inventory WHERE user_id=? AND quantity > 0", (user.id,))
+    rows = cursor.fetchall()
+
+    if not rows:
+        await message.reply("🎒 Ваш инвентарь пуст.")
+        return
+
+    text = "🎒 <b>Ваш инвентарь</b>\n\n"
+    for item_name, quantity in rows:
+        if item_name == "battle_ladushka":
+            text += f"🥊 <b>Боевая ладушка</b> ×{quantity}\n"
+        else:
+            text += f"📦 <b>{item_name}</b> ×{quantity}\n"
+
+    await message.reply(text)
+
+
+@dp.message(F.text.lower() == "ударить ладушкой")
+async def hit_with_ladushka(message: Message):
+    if not message.reply_to_message:
+        await message.reply("⚠️ Эта команда должна быть ответом на сообщение пользователя!")
+        return
+
+    sender = message.from_user
+    receiver = message.reply_to_message.from_user
+
+    register_user(sender)
+    register_user(receiver)
+
+    count = get_item_quantity(sender.id, "battle_ladushka")
+    if count <= 0:
+        await message.reply(
+            "❌ <b>У вас нет Боевой ладушки.</b>\n\n"
+            "🛒 Купить можно в магазине за 200 ладушек."
+        )
+        return
+
+    # Списываем 1 предмет
+    remove_item(sender.id, "battle_ladushka", 1)
+
+    sender_link = get_user_mention(sender)
+    receiver_link = get_user_mention(receiver)
+
+    # Варианты сообщений
+    phrases = [
+        f"🥊 {sender_link} ударил ладушкой {receiver_link}!\n\n👏 <b>ШЛЁП!</b>",
+        f"💥 {sender_link} размахнулся и влепил ладушку {receiver_link}!",
+        f"🏛 <b>Министр Ладушек одобрил удар.</b>\n\n🥊 {sender_link} ударил {receiver_link} ладушкой!"
+    ]
+
+    selected_phrase = random.choice(phrases)
+    await message.reply(selected_phrase, disable_web_page_preview=True)
+
+
+# --- ДЕНЕЖНЫЕ ПЕРЕВОДЫ ---
 
 @dp.message(F.text.lower().startswith("дать "))
 async def transfer_custom_amount(message: Message):
