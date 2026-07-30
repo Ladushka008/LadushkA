@@ -1,10 +1,8 @@
 import os
-import json
 import base64
 import asyncio
 import sqlite3
-import urllib.request
-import urllib.error
+import requests
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
@@ -12,7 +10,6 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.client.default import DefaultBotProperties
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 
 # ==========================
@@ -25,16 +22,10 @@ PORT = int(os.getenv("PORT", 8080))
 
 # GitHub настройки
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO = os.getenv("GITHUB_REPO")  # Формат: Ladushka008/LadushkA
-DB_FILE = "ladushki.db"
-GITHUB_FILE_PATH = "ladushki.db"
+GITHUB_REPO = os.getenv("GITHUB_REPO")  # Пример: Ladushka008/LadushkA
+DB_FILE = "database.db"
+GITHUB_FILE_PATH = "database.db"
 BRANCH = "main"
-
-raw_url = (os.getenv("WEBHOOK_URL") or "").strip()
-WEBHOOK_HOST = raw_url.removesuffix("/").removesuffix("/webhook").removesuffix("/")
-
-WEBHOOK_PATH = f"/webhook/{TOKEN}"
-WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
 bot = Bot(
     token=TOKEN,
@@ -42,93 +33,88 @@ bot = Bot(
 )
 
 dp = Dispatcher()
-
 db = None
 cursor = None
 
 
 # ==========================
-# GITHUB СИНХРОНИЗАЦИЯ (через urllib)
+# GITHUB СИНХРОНИЗАЦИЯ
 # ==========================
 
 def _sync_download():
     if not GITHUB_TOKEN or not GITHUB_REPO:
-        print("GitHub sync download skipped: token or repo not provided")
-        return False
-
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}?ref={BRANCH}"
-    req = urllib.request.Request(url, headers={
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "TelegramBot"
-    })
-
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            if resp.status == 200:
-                data = json.loads(resp.read().decode("utf-8"))
-                file_bytes = base64.b64decode(data.get("content", ""))
-                with open(DB_FILE, "wb") as f:
-                    f.write(file_bytes)
-                print("Database successfully downloaded from GitHub")
-                return True
-    except Exception as e:
-        print(f"GitHub sync download warning: {e}")
-    return False
-
-
-def _sync_upload():
-    if not GITHUB_TOKEN or not GITHUB_REPO:
-        print("GitHub sync upload skipped: token or repo not provided")
-        return False
-
-    if not os.path.exists(DB_FILE):
+        print("GitHub sync failed: missing token or repo")
         return False
 
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
     headers = {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "TelegramBot",
-        "Content-Type": "application/json"
+        "Accept": "application/vnd.github.v3+json"
     }
 
     try:
-        # Получаем current sha файла, если он существует
-        sha = None
-        get_req = urllib.request.Request(f"{url}?ref={BRANCH}", headers=headers)
-        try:
-            with urllib.request.urlopen(get_req, timeout=10) as resp:
-                if resp.status == 200:
-                    sha = json.loads(resp.read().decode("utf-8")).get("sha")
-        except Exception:
-            pass
+        response = requests.get(url, headers=headers, params={"ref": BRANCH}, timeout=10)
+        if response.status_code == 200:
+            content_b64 = response.json().get("content", "")
+            file_data = base64.b64decode(content_b64)
+            with open(DB_FILE, "wb") as f:
+                f.write(file_data)
+            print("Database downloaded from GitHub")
+            return True
+        else:
+            print(f"GitHub sync download failed: {response.status_code}")
+            return False
+    except Exception as e:
+        print(f"GitHub sync download error: {e}")
+        return False
 
+
+def _sync_upload():
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        print("GitHub sync failed: missing token or repo")
+        return False
+
+    if not os.path.exists(DB_FILE):
+        print("GitHub sync upload failed: DB file not found")
+        return False
+
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+
+    try:
         with open(DB_FILE, "rb") as f:
-            content_b64 = base64.b64encode(f.read()).decode("utf-8")
+            content_bytes = f.read()
+        content_b64 = base64.b64encode(content_bytes).decode("utf-8")
 
-        payload = {
-            "message": "Auto-update database",
+        sha = None
+        get_resp = requests.get(url, headers=headers, params={"ref": BRANCH}, timeout=10)
+        if get_resp.status_code == 200:
+            sha = get_resp.json().get("sha")
+
+        data = {
+            "message": "Auto-update database.db",
             "content": content_b64,
             "branch": BRANCH
         }
         if sha:
-            payload["sha"] = sha
+            data["sha"] = sha
 
-        data_bytes = json.dumps(payload).encode("utf-8")
-        put_req = urllib.request.Request(url, data=data_bytes, headers=headers, method="PUT")
-
-        with urllib.request.urlopen(put_req, timeout=10) as resp:
-            if resp.status in (200, 201):
-                print("Database successfully uploaded to GitHub")
-                return True
+        put_resp = requests.put(url, headers=headers, json=data, timeout=10)
+        if put_resp.status_code in [200, 201]:
+            print("Database uploaded to GitHub")
+            return True
+        else:
+            print(f"GitHub sync upload failed: {put_resp.status_code}")
+            return False
     except Exception as e:
-        print(f"GitHub sync upload warning: {e}")
-    return False
+        print(f"GitHub sync upload error: {e}")
+        return False
 
 
 def trigger_github_upload():
-    """Фоновая отправка файла на GitHub без задерживания ответа бота"""
     asyncio.create_task(asyncio.to_thread(_sync_upload))
 
 
@@ -462,33 +448,31 @@ async def reset(message: Message):
 
 
 # ==========================
-# WEBHOOK & AIOHTTP SETUP
+# ФЕЙКОВЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER
 # ==========================
 
-async def on_startup(bot: Bot):
-    print(f"Setting webhook to: {WEBHOOK_URL}")
-    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+async def handle_ping(request):
+    return web.Response(text="Bot is running!")
 
-async def on_shutdown(bot: Bot):
-    await bot.delete_webhook()
-    if db:
-        db.close()
-
-def main():
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
-
+async def start_web_server():
     app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    print(f"Web server started on port {PORT}")
 
-    webhook_requests_handler = SimpleRequestHandler(
-        dispatcher=dp,
-        bot=bot,
-    )
-    webhook_requests_handler.register(app, path=WEBHOOK_PATH)
 
-    setup_application(app, dp, bot=bot)
+async def main():
+    # Запускаем фейк-сервер, чтобы Render увидел открытый порт
+    await start_web_server()
+    
+    # Очищаем вебхук и запускаем polling
+    await bot.delete_webhook(drop_pending_updates=True)
+    print("Бот успешно запущен и ожидает сообщений!")
+    await dp.start_polling(bot)
 
-    web.run_app(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
