@@ -3,6 +3,7 @@ import base64
 import asyncio
 import sqlite3
 import requests
+import aiohttp
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
@@ -188,10 +189,13 @@ def get_balance(user_id):
     return row[0] if row else 0
 
 
-def profile_link(user):
+def get_user_mention(user):
+    """Возвращает имя пользователя со встроенной ссылкой на его профиль"""
     if user.username:
-        return f"https://t.me/{user.username}"
-    return f"tg://user?id={user.id}"
+        url = f"https://t.me/{user.username}"
+    else:
+        url = f"tg://user?id={user.id}"
+    return f'<a href="{url}">{user.full_name}</a>'
 
 
 def add_history(sender, receiver, amount, action, reason=""):
@@ -225,9 +229,10 @@ def is_admin(user_id: int):
 async def start(message: Message):
     register_user(message.from_user)
     await message.answer(
-        "👋 Добро пожаловать!\n\n"
-        "Это бот группы <b>Ладушки</b>.\n\n"
-        "Напиши <b>баланс</b>, чтобы посмотреть свои ладушки."
+        "✨ <b>Добро пожаловать в бота сообщества Ладушки!</b>\n\n"
+        "💬 <b>Команды:</b>\n"
+        "• Напишите <b>баланс</b> — чтобы узнать счет.\n"
+        "• Ответьте на сообщение текстом <b>дать 50</b> — чтобы перевести ладушки."
     )
 
 
@@ -241,18 +246,77 @@ async def balance(message: Message):
         register_user(target)
 
     user_balance = get_balance(target.id)
+    user_link = get_user_mention(target)
 
     text = (
-        f"👤 <b>{target.full_name}</b>\n\n"
-        f"🔗 {profile_link(target)}\n\n"
-        f"🪙 Ладушки: <b>{user_balance}</b>"
+        f"┌ 👤 <b>Профиль:</b> {user_link}\n"
+        f"└ 🪙 <b>Баланс:</b> {user_balance} ладушек"
     )
 
-    await message.answer(text)
+    await message.answer(text, disable_web_page_preview=True)
+
+
+@dp.message(F.text.lower().startswith("дать "))
+async def transfer_custom_amount(message: Message):
+    if not message.reply_to_message:
+        await message.reply("⚠️ Эта команда должна быть ответом на сообщение пользователя!")
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.reply("⚠️ Укажите сумму числом. Пример: <code>дать 50</code>")
+        return
+
+    amount = int(parts[1])
+    if amount <= 0:
+        await message.reply("❌ Сумма перевода должна быть больше 0.")
+        return
+
+    sender = message.from_user
+    receiver = message.reply_to_message.from_user
+
+    if sender.id == receiver.id:
+        await message.reply("❌ Нельзя переводить ладушки самому себе.")
+        return
+
+    register_user(sender)
+    register_user(receiver)
+
+    sender_balance = get_balance(sender.id)
+
+    if sender_balance < amount:
+        await message.reply(
+            f"❌ <b>Недостаточно средств!</b>\n"
+            f"У вас на балансе: <b>{sender_balance}</b> ладушек."
+        )
+        return
+
+    # Перевод
+    cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (amount, sender.id))
+    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, receiver.id))
+    db.commit()
+
+    add_history(sender.id, receiver.id, amount, "transfer")
+
+    sender_new_bal = get_balance(sender.id)
+    receiver_new_bal = get_balance(receiver.id)
+
+    sender_mention = get_user_mention(sender)
+    receiver_mention = get_user_mention(receiver)
+
+    await message.reply(
+        f"✅ <b>Перевод успешно выполнен!</b>\n\n"
+        f"📤 <b>Отправитель:</b> {sender_mention}\n"
+        f"📥 <b>Получатель:</b> {receiver_mention}\n"
+        f"💰 <b>Сумма:</b> {amount} ладушек\n\n"
+        f"📊 <b>Новый баланс {receiver_mention}:</b> {receiver_new_bal} ладушек\n"
+        f"📊 <b>Ваш новый баланс:</b> {sender_new_bal} ладушек",
+        disable_web_page_preview=True
+    )
 
 
 @dp.message(F.text.lower() == "ладушка")
-async def transfer_ladushka(message: Message):
+async def transfer_one_ladushka(message: Message):
     if not message.reply_to_message:
         return
 
@@ -278,19 +342,23 @@ async def transfer_ladushka(message: Message):
 
     add_history(sender.id, receiver.id, 1, "transfer")
 
+    sender_mention = get_user_mention(sender)
+    receiver_mention = get_user_mention(receiver)
+
     await message.reply(
-        "🪙 <b>Ладушка передана!</b>\n\n"
-        f"От: {sender.full_name}\n"
-        f"Кому: {receiver.full_name}\n\n"
+        f"🪙 <b>Ладушка передана!</b>\n\n"
+        f"От: {sender_mention}\n"
+        f"Кому: {receiver_mention}\n\n"
         f"Теперь у вас {get_balance(sender.id)} ладушек.\n"
-        f"У получателя {get_balance(receiver.id)} ладушек."
+        f"У {receiver_mention} {get_balance(receiver.id)} ладушек.",
+        disable_web_page_preview=True
     )
 
 
 @dp.message(Command("top"))
 async def top_players(message: Message):
     cursor.execute("""
-        SELECT full_name, balance
+        SELECT user_id, full_name, username, balance
         FROM users
         ORDER BY balance DESC
         LIMIT 10
@@ -298,14 +366,16 @@ async def top_players(message: Message):
     rows = cursor.fetchall()
 
     if not rows:
-        await message.answer("Пока нет игроков.")
+        await message.answer("Пока нет участников.")
         return
 
-    text = "🏆 <b>ТОП игроков</b>\n\n"
+    text = "🏆 <b>ТОП Участников</b>\n\n"
     for i, row in enumerate(rows, start=1):
-        text += f"{i}. {row[0]} — 🪙 {row[1]}\n"
+        uid, name, uname, bal = row
+        url = f"https://t.me/{uname}" if uname else f"tg://user?id={uid}"
+        text += f"{i}. <a href='{url}'>{name}</a> — 🪙 <b>{bal}</b>\n"
 
-    await message.answer(text)
+    await message.answer(text, disable_web_page_preview=True)
 
 
 @dp.message(Command("history"))
@@ -323,7 +393,7 @@ async def history(message: Message):
         await message.answer("📜 История пуста.")
         return
 
-    text = "📜 <b>Последние операции</b>\n\n"
+    text = "📜 <b>Последние операции:</b>\n\n"
     for action, amount, date in rows:
         text += f"• {action} | {amount} 🪙 | {date}\n"
 
@@ -352,7 +422,8 @@ async def add_balance(message: Message):
     db.commit()
 
     add_history(ADMIN_ID, user.id, amount, "add")
-    await message.answer(f"✅ {user.full_name} получил {amount} ладушек.")
+    user_link = get_user_mention(user)
+    await message.answer(f"✅ {user_link} получил {amount} ладушек.", disable_web_page_preview=True)
 
 
 @dp.message(Command("remove"))
@@ -412,7 +483,8 @@ async def fine(message: Message):
     db.commit()
     trigger_github_upload()
 
-    await message.answer(f"⚠️ Игрок {user.full_name} получил штраф {amount} ладушек.")
+    user_link = get_user_mention(user)
+    await message.answer(f"⚠️ Игрок {user_link} получил штраф {amount} ладушек.", disable_web_page_preview=True)
 
 
 @dp.message(Command("bonus"))
@@ -432,7 +504,8 @@ async def bonus(message: Message):
     db.commit()
     trigger_github_upload()
 
-    await message.answer(f"🎁 Игрок {user.full_name} получил бонус {amount} ладушек.")
+    user_link = get_user_mention(user)
+    await message.answer(f"🎁 Игрок {user_link} получил бонус {amount} ладушек.", disable_web_page_preview=True)
 
 
 @dp.message(Command("reset"))
@@ -448,7 +521,7 @@ async def reset(message: Message):
 
 
 # ==========================
-# ФЕЙКОВЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER
+# ВЕБ-СЕРВЕР И АВТОПИНГ (KEEP-ALIVE)
 # ==========================
 
 async def handle_ping(request):
@@ -463,10 +536,43 @@ async def start_web_server():
     await site.start()
     print(f"Web server started on port {PORT}")
 
+async def auto_ping_task():
+    """Фоновая задача автопинга каждые 4 минуты с гарантированной повторной попыткой"""
+    ping_url = "https://ladushka.onrender.com/"
+    
+    # Ждём пару секунд перед первым пингом
+    await asyncio.sleep(10)
+    
+    async with aiohttp.ClientSession() as session:
+        while True:
+            success = False
+            # Пытаемся стучаться (2 попытки)
+            for attempt in range(1, 3):
+                try:
+                    async with session.get(ping_url, timeout=10) as response:
+                        if response.status == 200:
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] Auto-ping success: {ping_url}")
+                            success = True
+                            break
+                        else:
+                            print(f"Auto-ping attempt {attempt} status: {response.status}")
+                except Exception as e:
+                    print(f"Auto-ping attempt {attempt} error: {e}")
+                
+                # Если первая попытка упала, ждем 5 секунд и делаем повтор
+                if not success and attempt == 1:
+                    await asyncio.sleep(5)
+
+            # Каждые 4 минуты (240 секунд)
+            await asyncio.sleep(240)
+
 
 async def main():
-    # Запускаем фейк-сервер, чтобы Render увидел открытый порт
+    # Запускаем веб-сервер
     await start_web_server()
+    
+    # Запускаем фоновый автопинг Render каждые 4 минуты
+    asyncio.create_task(auto_ping_task())
     
     # Очищаем вебхук и запускаем polling
     await bot.delete_webhook(drop_pending_updates=True)
