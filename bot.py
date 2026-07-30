@@ -25,14 +25,13 @@ PORT = int(os.getenv("PORT", 8080))
 
 # GitHub настройки
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO = os.getenv("GITHUB_REPO")
+GITHUB_REPO = os.getenv("GITHUB_REPO")  # Формат: Ladushka008/LadushkA
 DB_FILE = "ladushki.db"
 GITHUB_FILE_PATH = "ladushki.db"
 BRANCH = "main"
 
-# Автоматически определяем хост через Render или WEBHOOK_URL
-raw_url = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL") or ""
-WEBHOOK_HOST = raw_url.strip().removesuffix("/").removesuffix("/webhook").removesuffix("/")
+raw_url = (os.getenv("WEBHOOK_URL") or "").strip()
+WEBHOOK_HOST = raw_url.removesuffix("/").removesuffix("/webhook").removesuffix("/")
 
 WEBHOOK_PATH = f"/webhook/{TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
@@ -49,11 +48,12 @@ cursor = None
 
 
 # ==========================
-# GITHUB СИНХРОНИЗАЦИЯ
+# GITHUB СИНХРОНИЗАЦИЯ (через urllib)
 # ==========================
 
 def _sync_download():
     if not GITHUB_TOKEN or not GITHUB_REPO:
+        print("GitHub sync download skipped: token or repo not provided")
         return False
 
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}?ref={BRANCH}"
@@ -70,15 +70,19 @@ def _sync_download():
                 file_bytes = base64.b64decode(data.get("content", ""))
                 with open(DB_FILE, "wb") as f:
                     f.write(file_bytes)
-                print("Database downloaded from GitHub")
+                print("Database successfully downloaded from GitHub")
                 return True
     except Exception as e:
-        print(f"GitHub download warning: {e}")
+        print(f"GitHub sync download warning: {e}")
     return False
 
 
 def _sync_upload():
-    if not GITHUB_TOKEN or not GITHUB_REPO or not os.path.exists(DB_FILE):
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        print("GitHub sync upload skipped: token or repo not provided")
+        return False
+
+    if not os.path.exists(DB_FILE):
         return False
 
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
@@ -90,6 +94,7 @@ def _sync_upload():
     }
 
     try:
+        # Получаем current sha файла, если он существует
         sha = None
         get_req = urllib.request.Request(f"{url}?ref={BRANCH}", headers=headers)
         try:
@@ -115,14 +120,15 @@ def _sync_upload():
 
         with urllib.request.urlopen(put_req, timeout=10) as resp:
             if resp.status in (200, 201):
-                print("Database uploaded to GitHub")
+                print("Database successfully uploaded to GitHub")
                 return True
     except Exception as e:
-        print(f"GitHub upload warning: {e}")
+        print(f"GitHub sync upload warning: {e}")
     return False
 
 
 def trigger_github_upload():
+    """Фоновая отправка файла на GitHub без задерживания ответа бота"""
     asyncio.create_task(asyncio.to_thread(_sync_upload))
 
 
@@ -456,44 +462,23 @@ async def reset(message: Message):
 
 
 # ==========================
-# WEBHOOK & DIAGNOSTICS
+# WEBHOOK & AIOHTTP SETUP
 # ==========================
 
-async def health_check(request):
-    try:
-        info = await bot.get_webhook_info()
-        res = (
-            f"✅ Бот работает!\n"
-            f"Текущий Webhook URL: {info.url or 'НЕ УСТАНОВЛЕН'}\n"
-            f"Ожидают доставки: {info.pending_update_count}\n"
-            f"Последняя ошибка Telegram: {info.last_error_message or 'Ошибок нет'}"
-        )
-    except Exception as e:
-        res = f"❌ Ошибка подключения бота: {e}"
-    return web.Response(text=res)
-
-
 async def on_startup(bot: Bot):
-    if WEBHOOK_URL.startswith("http"):
-        print(f"Установка Webhook на: {WEBHOOK_URL}")
-        await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
-    else:
-        print(f"Ошибка: Некорректный WEBHOOK_URL -> {WEBHOOK_URL}")
-
+    print(f"Setting webhook to: {WEBHOOK_URL}")
+    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
 
 async def on_shutdown(bot: Bot):
     await bot.delete_webhook()
     if db:
         db.close()
 
-
 def main():
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
     app = web.Application()
-
-    app.router.add_get("/", health_check)
 
     webhook_requests_handler = SimpleRequestHandler(
         dispatcher=dp,
@@ -504,7 +489,6 @@ def main():
     setup_application(app, dp, bot=bot)
 
     web.run_app(app, host="0.0.0.0", port=PORT)
-
 
 if __name__ == "__main__":
     main()
