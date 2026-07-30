@@ -142,15 +142,18 @@ def init_db():
         username TEXT,
         full_name TEXT,
         balance INTEGER DEFAULT 0,
-        last_bonus TEXT
+        last_bonus TEXT,
+        created_at TEXT
     )
     """)
 
-    # Миграция: добавляем колонку last_bonus, если её ещё нет в существующей базе
+    # Миграция: проверяем и добавляем отсутствующие колонки
     cursor.execute("PRAGMA table_info(users)")
     columns = [column[1] for column in cursor.fetchall()]
     if "last_bonus" not in columns:
         cursor.execute("ALTER TABLE users ADD COLUMN last_bonus TEXT")
+    if "created_at" not in columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN created_at TEXT")
 
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS history(
@@ -185,12 +188,13 @@ init_db()
 # ==========================
 
 def register_user(user):
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cursor.execute(
         """
-        INSERT OR IGNORE INTO users(user_id, username, full_name, balance, last_bonus)
-        VALUES(?,?,?,0,NULL)
+        INSERT OR IGNORE INTO users(user_id, username, full_name, balance, last_bonus, created_at)
+        VALUES(?,?,?,0,NULL,?)
         """,
-        (user.id, user.username, user.full_name)
+        (user.id, user.username, user.full_name, now_str)
     )
 
     cursor.execute(
@@ -218,6 +222,13 @@ def get_user_mention(user):
     else:
         url = f"tg://user?id={user.id}"
     return f'<a href="{url}">{user.full_name}</a>'
+
+
+def get_total_items_count(user_id):
+    """Возвращает общее количество всех предметов у пользователя"""
+    cursor.execute("SELECT SUM(quantity) FROM inventory WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    return row[0] if row and row[0] is not None else 0
 
 
 def add_history(sender, receiver, amount, action, reason=""):
@@ -274,12 +285,19 @@ def remove_item(user_id, item_name, count=1):
 # ХЕНДЛЕРЫ
 # ==========================
 
+# Отклики на слово "бот"
+@dp.message(F.text.lower() == "бот")
+async def bot_reply(message: Message):
+    await message.reply("Тут я,")
+
+
 @dp.message(Command("start"))
 async def start(message: Message):
     register_user(message.from_user)
     await message.answer(
         "✨ <b>Добро пожаловать в бота сообщества Ладушки!</b>\n\n"
         "💬 <b>Команды:</b>\n"
+        "• Напишите <b>профиль</b> — чтобы посмотреть свой профиль.\n"
         "• Напишите <b>баланс</b> — чтобы узнать счет.\n"
         "• Напишите <b>бонус</b> — чтобы получить ежедневный бонус.\n"
         "• Напишите <b>магазин</b> — чтобы открыть магазин предметов.\n"
@@ -288,6 +306,42 @@ async def start(message: Message):
         "• Ответьте на сообщение текстом <b>ударить ладушкой</b> — применить Боевую ладушку.\n"
         "• Ответьте на сообщение текстом <b>кинуть томат</b> — бросить томат в участника."
     )
+
+
+# Команда "профиль"
+@dp.message(F.text.lower() == "профиль")
+async def profile_handler(message: Message):
+    register_user(message.from_user)
+    target = message.reply_to_message.from_user if message.reply_to_message else message.from_user
+    register_user(target)
+
+    user_balance = get_balance(target.id)
+    items_count = get_total_items_count(target.id)
+
+    # Получение даты регистрации
+    cursor.execute("SELECT created_at FROM users WHERE user_id=?", (target.id,))
+    row = cursor.fetchone()
+    created_at_str = row[0] if row else None
+
+    if created_at_str:
+        try:
+            created_date = datetime.strptime(created_at_str, "%Y-%m-%d %H:%M:%S")
+            days_in_bot = (datetime.now() - created_date).days
+            if days_in_bot < 1:
+                days_in_bot = 1  # Если меньше дня, показываем 1
+        except Exception:
+            days_in_bot = 1
+    else:
+        days_in_bot = 1
+
+    text = (
+        f"👤 <b>Имя:</b> {target.full_name}\n\n"
+        f"💰 <b>Баланс:</b> {user_balance} ладушек\n\n"
+        f"🎒 <b>Предметов:</b> {items_count}\n\n"
+        f"📅 <b>В боте:</b> {days_in_bot} дней"
+    )
+
+    await message.answer(text, disable_web_page_preview=True)
 
 
 @dp.message(F.text.lower() == "баланс")
