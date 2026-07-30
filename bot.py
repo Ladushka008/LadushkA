@@ -15,7 +15,7 @@ from aiohttp import web
 # НАСТРОЙКИ (Переменные окружения)
 # ==========================
 
-TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.getenv("8529768374:AAHUF34sL8NygJousF46asP-FU9-H1U_Oac")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7837011810"))
 
 # Render автоматически передает PORT. Если локально — по умолчанию 8080.
