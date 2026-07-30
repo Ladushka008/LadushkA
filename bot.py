@@ -16,7 +16,7 @@ from aiohttp import web
 # ==========================
 
 # 1. Токен получаем по КЛЮЧУ переменной "BOT_TOKEN"
-TOKEN = os.getenv("8529768374:AAFn9sTmEJG1SVhRDtxlWoAzwC9G5zz0v8s")
+TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7837011810"))
 
 # Render автоматически передает PORT. По умолчанию 8080.
