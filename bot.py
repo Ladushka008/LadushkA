@@ -12,7 +12,7 @@ from aiogram.client.default import DefaultBotProperties
 # НАСТРОЙКИ
 # ==========================
 
-TOKEN = "ТОКЕН_БОТА"
+TOKEN = "8529768374:AAHUF34sL8NygJousF46asP-FU9-H1U_Oac"
 
 ADMIN_ID = 7837011810
 
