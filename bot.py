@@ -42,14 +42,7 @@ dp = Dispatcher()
 db = None
 cursor = None
 
-# Состояние дуэлей
-# {
-#    "status": "pending" | "active",
-#    "challenger": User,
-#    "opponent": User,
-#    "current_turn": User (id),
-#    "timer_task": asyncio.Task
-# }
+# Глобальное состояние дуэли
 active_duel = None
 
 
@@ -105,7 +98,6 @@ def _sync_upload():
             content_bytes = f.read()
         content_b64 = base64.b64encode(content_bytes).decode("utf-8")
 
-        # Всегда получаем актуальный SHA файла с GitHub перед загрузкой
         sha = None
         get_resp = requests.get(url, headers=headers, params={"ref": BRANCH}, timeout=10)
         if get_resp.status_code == 200:
@@ -159,7 +151,6 @@ def init_db():
     )
     """)
 
-    # Миграция: проверяем и добавляем отсутствующие колонки
     cursor.execute("PRAGMA table_info(users)")
     columns = [column[1] for column in cursor.fetchall()]
     if "last_bonus" not in columns:
@@ -181,7 +172,6 @@ def init_db():
     )
     """)
 
-    # Таблица для инвентаря
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS inventory(
         user_id INTEGER,
@@ -202,6 +192,8 @@ init_db()
 # ==========================
 
 def register_user(user):
+    if not user:
+        return
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cursor.execute(
         """
@@ -236,6 +228,8 @@ def get_reputation(user_id):
 
 def get_user_mention(user):
     """Возвращает имя пользователя со встроенной ссылкой на его профиль"""
+    if not user:
+        return "Неизвестный"
     if user.username:
         url = f"https://t.me/{user.username}"
     else:
@@ -244,7 +238,6 @@ def get_user_mention(user):
 
 
 def get_total_items_count(user_id):
-    """Возвращает общее количество всех предметов у пользователя"""
     cursor.execute("SELECT SUM(quantity) FROM inventory WHERE user_id=? AND quantity > 0", (user_id,))
     row = cursor.fetchone()
     return row[0] if row and row[0] is not None else 0
@@ -273,7 +266,6 @@ def is_admin(user_id: int):
     return user_id == ADMIN_ID
 
 
-# Функции для работы с инвентарём
 def get_item_quantity(user_id, item_name):
     cursor.execute("SELECT quantity FROM inventory WHERE user_id=? AND item_name=?", (user_id, item_name))
     row = cursor.fetchone()
@@ -334,7 +326,7 @@ async def start_duel_request(message: Message):
         await message.reply("⚔️ Сейчас уже идёт дуэль. Дождитесь её окончания.")
         return
 
-    if not message.reply_to_message:
+    if not message.reply_to_message or not message.reply_to_message.from_user:
         await message.reply("⚠️ Эта команда должна быть ответом на сообщение пользователя!")
         return
 
@@ -388,7 +380,6 @@ async def accept_duel_callback(callback: CallbackQuery):
         return
 
     parts = callback.data.split("_")
-    challenger_id = int(parts[2])
     opponent_id = int(parts[3])
 
     if callback.from_user.id != opponent_id:
@@ -438,10 +429,9 @@ async def decline_duel_callback(callback: CallbackQuery):
 
 
 # ==========================
-# ХЕНДЛЕРЫ
+# ОСНОВНЫЕ ХЕНДЛЕРЫ
 # ==========================
 
-# Отклики на слово "бот"
 @dp.message(F.text.lower() == "бот")
 async def bot_reply(message: Message):
     await message.reply("Тут я, тут")
@@ -467,11 +457,10 @@ async def start(message: Message):
     )
 
 
-# Команда "профиль"
 @dp.message(F.text.lower() == "профиль")
 async def profile_handler(message: Message):
     register_user(message.from_user)
-    target = message.reply_to_message.from_user if message.reply_to_message else message.from_user
+    target = message.reply_to_message.from_user if (message.reply_to_message and message.reply_to_message.from_user) else message.from_user
     register_user(target)
 
     user_balance = get_balance(target.id)
@@ -493,7 +482,7 @@ async def balance(message: Message):
     register_user(message.from_user)
     target = message.from_user
 
-    if message.reply_to_message:
+    if message.reply_to_message and message.reply_to_message.from_user:
         target = message.reply_to_message.from_user
         register_user(target)
 
@@ -540,7 +529,6 @@ async def get_daily_bonus(message: Message):
         (reward, now.isoformat(), user.id)
     )
     db.commit()
-
     trigger_github_upload()
 
     add_history(0, user.id, reward, "daily_bonus")
@@ -577,10 +565,7 @@ async def buy_battle_ladushka(message: Message):
     user_bal = get_balance(user.id)
 
     if user_bal < price:
-        await message.reply(
-            f"❌ <b>Недостаточно ладушек.</b>\n\n"
-            f"Ваш баланс: <b>{user_bal}</b> ладушек"
-        )
+        await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{user_bal}</b> ладушек")
         return
 
     cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (price, user.id))
@@ -605,10 +590,7 @@ async def buy_tomato(message: Message):
     user_bal = get_balance(user.id)
 
     if user_bal < price:
-        await message.reply(
-            f"❌ <b>Недостаточно ладушек.</b>\n\n"
-            f"Ваш баланс: <b>{user_bal}</b> ладушек"
-        )
+        await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{user_bal}</b> ладушек")
         return
 
     cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (price, user.id))
@@ -633,10 +615,7 @@ async def buy_rat(message: Message):
     user_bal = get_balance(user.id)
 
     if user_bal < price:
-        await message.reply(
-            f"❌ <b>Недостаточно ладушек.</b>\n\n"
-            f"Ваш баланс: <b>{user_bal}</b> ладушек"
-        )
+        await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{user_bal}</b> ладушек")
         return
 
     cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (price, user.id))
@@ -680,7 +659,7 @@ async def inventory_handler(message: Message):
 
 @dp.message(F.text.lower() == "ударить ладушкой")
 async def hit_with_ladushka(message: Message):
-    if not message.reply_to_message:
+    if not message.reply_to_message or not message.reply_to_message.from_user:
         await message.reply("⚠️ Эта команда должна быть ответом на сообщение пользователя!")
         return
 
@@ -692,10 +671,7 @@ async def hit_with_ladushka(message: Message):
 
     count = get_item_quantity(sender.id, "battle_ladushka")
     if count <= 0:
-        await message.reply(
-            "❌ <b>У вас нет Боевой ладушки.</b>\n\n"
-            "🛒 Купить можно в магазине за 200 ладушек."
-        )
+        await message.reply("❌ <b>У вас нет Боевой ладушки.</b>\n\n🛒 Купить можно в магазине за 200 ладушек.")
         return
 
     remove_item(sender.id, "battle_ladushka", 1)
@@ -715,7 +691,7 @@ async def hit_with_ladushka(message: Message):
 
 @dp.message(F.text.lower() == "кинуть томат")
 async def throw_tomato(message: Message):
-    if not message.reply_to_message:
+    if not message.reply_to_message or not message.reply_to_message.from_user:
         await message.reply("⚠️ Эта команда должна быть ответом на сообщение пользователя!")
         return
 
@@ -727,10 +703,7 @@ async def throw_tomato(message: Message):
 
     count = get_item_quantity(sender.id, "tomato")
     if count <= 0:
-        await message.reply(
-            "❌ <b>У вас нет томатов.</b>\n\n"
-            "🛒 Купить можно в магазине за 100 ладушек."
-        )
+        await message.reply("❌ <b>У вас нет томатов.</b>\n\n🛒 Купить можно в магазине за 100 ладушек.")
         return
 
     remove_item(sender.id, "tomato", 1)
@@ -748,8 +721,6 @@ async def throw_tomato(message: Message):
     await message.reply(selected_phrase, disable_web_page_preview=True)
 
 
-# --- ПРЕДМЕТ: КРЫСА ---
-
 @dp.message(F.text.lower() == "крыса")
 async def use_rat(message: Message):
     sender = message.from_user
@@ -760,7 +731,6 @@ async def use_rat(message: Message):
         await message.reply("❌ У вас нет крысы.")
         return
 
-    # Выбираем случайную цель из зарегистрированных пользователей (исключая самого игрока)
     cursor.execute("SELECT user_id, full_name, balance FROM users WHERE user_id != ?", (sender.id,))
     targets = cursor.fetchall()
 
@@ -769,17 +739,12 @@ async def use_rat(message: Message):
         return
 
     target_id, target_name, target_bal = random.choice(targets)
-
-    # Используем и списываем крысу
     remove_item(sender.id, "rat", 1)
 
     wanted_steal = random.randint(1, 3)
 
     if target_bal <= 0:
-        await message.reply(
-            f"🐀 Крыса обыскала карманы {target_name}...\n\n"
-            f"😢 Но там не оказалось ни одной ладушки."
-        )
+        await message.reply(f"🐀 Крыса обыскала карманы {target_name}...\n\n😢 Но там не оказалось ни одной ладушки.")
     elif target_bal < wanted_steal:
         stolen = target_bal
         cursor.execute("UPDATE users SET balance = 0 WHERE user_id=?", (target_id,))
@@ -801,17 +766,14 @@ async def use_rat(message: Message):
         trigger_github_upload()
         add_history(target_id, sender.id, stolen, "rat_steal")
 
-        await message.reply(
-            f"🐀 Крыса пробралась к {target_name}!\n\n"
-            f"💸 Украдено: {stolen} ладушки"
-        )
+        await message.reply(f"🐀 Крыса пробралась к {target_name}!\n\n💸 Украдено: {stolen} ладушки")
 
 
-# --- ДЕНЕЖНЫЕ ПЕРЕВОДЫ ---
+# --- ДЕНЕЖНЫЕ ПЕРЕВОДЫ И ХОДЫ В ДУЭЛИ ---
 
 @dp.message(F.text.lower().startswith("дать "))
 async def transfer_custom_amount(message: Message):
-    if not message.reply_to_message:
+    if not message.reply_to_message or not message.reply_to_message.from_user:
         await message.reply("⚠️ Эта команда должна быть ответом на сообщение пользователя!")
         return
 
@@ -838,10 +800,7 @@ async def transfer_custom_amount(message: Message):
     sender_balance = get_balance(sender.id)
 
     if sender_balance < amount:
-        await message.reply(
-            f"❌ <b>Недостаточно средств!</b>\n"
-            f"У вас на балансе: <b>{sender_balance}</b> ладушек."
-        )
+        await message.reply(f"❌ <b>Недостаточно средств!</b>\nУ вас на балансе: <b>{sender_balance}</b> ладушек.")
         return
 
     cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (amount, sender.id))
@@ -873,12 +832,12 @@ async def transfer_one_ladushka(message: Message):
 
     sender = message.from_user
 
-    # Проверяем, идёт ли активная дуэль
+    # Обработка активной дуэли
     if active_duel and active_duel["status"] == "active":
         p1 = active_duel["challenger"]
         p2 = active_duel["opponent"]
 
-        # Если пишет игрок, не участвующий в дуэли — игнорируем
+        # Если пишет игрок, не участвующий в дуэли — игнорируем полностью
         if sender.id not in [p1.id, p2.id]:
             return
 
@@ -887,7 +846,6 @@ async def transfer_one_ladushka(message: Message):
             await message.reply("⏳ Сейчас не ваш ход.")
             return
 
-        # Игрок делает ход в дуэли
         reset_duel_timer(message.chat.id)
         attacker = p1 if sender.id == p1.id else p2
         defender = p2 if sender.id == p1.id else p1
@@ -895,7 +853,7 @@ async def transfer_one_ladushka(message: Message):
         attacker_mention = get_user_mention(attacker)
         defender_mention = get_user_mention(defender)
 
-        # Редкий победный удар (~25% шанс)
+        # 25% шанс нокаута/победного удара
         is_finish = random.random() < 0.25
 
         if is_finish:
@@ -930,8 +888,8 @@ async def transfer_one_ladushka(message: Message):
             await message.answer(text, disable_web_page_preview=True)
             return
 
-    # Если дуэли нет, выполняем обычную передачу 1 ладушки по реплаю
-    if not message.reply_to_message:
+    # Обычная передача 1 ладушки вне дуэли
+    if not message.reply_to_message or not message.reply_to_message.from_user:
         return
 
     receiver = message.reply_to_message.from_user
@@ -990,6 +948,7 @@ async def top_players(message: Message):
 
     await message.answer(text, disable_web_page_preview=True)
 
+
 @dp.message(Command("history"))
 async def history(message: Message):
     cursor.execute("""
@@ -1012,14 +971,14 @@ async def history(message: Message):
     await message.answer(text)
 
 
-# --- СИСТЕМА РЕПУТАЦИИ (ТОЛЬКО ДЛЯ АДМИНОВ) ---
+# --- РЕПУТАЦИЯ ---
 
 @dp.message(F.text.lower() == "+реп")
 async def add_reputation(message: Message):
     if not is_admin(message.from_user.id):
         return
 
-    if not message.reply_to_message:
+    if not message.reply_to_message or not message.reply_to_message.from_user:
         await message.reply("❌ Ответьте на сообщение пользователя.")
         return
 
@@ -1053,7 +1012,7 @@ async def remove_reputation(message: Message):
     if not is_admin(message.from_user.id):
         return
 
-    if not message.reply_to_message:
+    if not message.reply_to_message or not message.reply_to_message.from_user:
         await message.reply("❌ Ответьте на сообщение пользователя.")
         return
 
@@ -1082,7 +1041,6 @@ async def remove_reputation(message: Message):
     )
 
 
-# Команда "репутация" — ТОП-5 по репутации
 @dp.message(F.text.lower() == "репутация")
 async def top_reputation_handler(message: Message):
     cursor.execute("""
@@ -1107,14 +1065,14 @@ async def top_reputation_handler(message: Message):
     await message.answer(text)
 
 
-# --- АДМИНСКИЕ КОМАНДЫ И НОВАЯ СИСТЕМА ШТРАФОВ ---
+# --- АДМИНСКИЕ КОМАНДЫ И ШТРАФЫ ---
 
 @dp.message(F.text.lower().startswith("штраф"))
 async def fine_handler(message: Message):
     if not is_admin(message.from_user.id):
         return
 
-    if not message.reply_to_message:
+    if not message.reply_to_message or not message.reply_to_message.from_user:
         await message.reply("❌ Ответьте на сообщение игрока.")
         return
 
@@ -1134,10 +1092,7 @@ async def fine_handler(message: Message):
     current_bal = get_balance(target.id)
 
     if current_bal <= 0:
-        await message.reply(
-            "🚔 Штраф не удалось взыскать.\n\n"
-            "😅 У игрока нет ладушек для списания."
-        )
+        await message.reply("🚔 Штраф не удалось взыскать.\n\n😅 У игрока нет ладушек для списания.")
         return
 
     if current_bal < fine_amount:
@@ -1171,7 +1126,7 @@ async def fine_handler(message: Message):
 
 @dp.message(Command("add"))
 async def add_balance(message: Message):
-    if not is_admin(message.from_user.id) or not message.reply_to_message:
+    if not is_admin(message.from_user.id) or not message.reply_to_message or not message.reply_to_message.from_user:
         return
     args = message.text.split()
     if len(args) != 2:
@@ -1195,7 +1150,7 @@ async def add_balance(message: Message):
 
 @dp.message(Command("remove"))
 async def remove_balance(message: Message):
-    if not is_admin(message.from_user.id) or not message.reply_to_message:
+    if not is_admin(message.from_user.id) or not message.reply_to_message or not message.reply_to_message.from_user:
         return
     args = message.text.split()
     if len(args) != 2:
@@ -1215,7 +1170,7 @@ async def remove_balance(message: Message):
 
 @dp.message(Command("set"))
 async def set_balance(message: Message):
-    if not is_admin(message.from_user.id) or not message.reply_to_message:
+    if not is_admin(message.from_user.id) or not message.reply_to_message or not message.reply_to_message.from_user:
         return
     args = message.text.split()
     if len(args) != 2:
@@ -1235,7 +1190,7 @@ async def set_balance(message: Message):
 
 @dp.message(Command("admin_bonus"))
 async def admin_bonus(message: Message):
-    if not is_admin(message.from_user.id) or not message.reply_to_message:
+    if not is_admin(message.from_user.id) or not message.reply_to_message or not message.reply_to_message.from_user:
         return
     args = message.text.split()
     if len(args) < 2:
@@ -1256,7 +1211,7 @@ async def admin_bonus(message: Message):
 
 @dp.message(Command("reset"))
 async def reset(message: Message):
-    if not is_admin(message.from_user.id) or not message.reply_to_message:
+    if not is_admin(message.from_user.id) or not message.reply_to_message or not message.reply_to_message.from_user:
         return
     user = message.reply_to_message.from_user
     cursor.execute("UPDATE users SET balance=0 WHERE user_id=?", (user.id,))
@@ -1267,7 +1222,7 @@ async def reset(message: Message):
 
 
 # ==========================
-# ВЕБ-СЕРВЕР, АВТОПИНГ, ОЧИСТКА БД И РАССЫЛКА
+# ВЕБ-СЕРВЕР И ФОНОВЫЕ ЗАДАЧИ
 # ==========================
 
 async def handle_ping(request):
@@ -1284,7 +1239,6 @@ async def start_web_server():
 
 
 async def auto_ping_task():
-    """Фоновая задача автопинга каждые 4 минуты"""
     ping_url = "https://ladushka.onrender.com/"
     await asyncio.sleep(10)
     
@@ -1310,14 +1264,12 @@ async def auto_ping_task():
 
 
 async def daily_ladushki_task():
-    """Фоновая задача: рассылка ровно в 19:00 по Киевскому времени в группу @ladushka09"""
     kyiv_tz = zoneinfo.ZoneInfo("Europe/Kyiv")
     
     while True:
         now = datetime.now(kyiv_tz)
         target_time = now.replace(hour=19, minute=0, second=0, microsecond=0)
         
-        # Если 19:00 уже прошло сегодня, переносим на завтра
         if now >= target_time:
             target_time += timedelta(days=1)
         
@@ -1326,7 +1278,6 @@ async def daily_ladushki_task():
         
         await asyncio.sleep(wait_seconds)
         
-        # Отправка сообщения в группу
         try:
             text = (
                 "👏 <b>19:00 — Время петь «Ладушки»!</b> 👏\n\n"
@@ -1340,40 +1291,26 @@ async def daily_ladushki_task():
 
 
 async def cleanup_db_task():
-    """Фоновая задача: регулярная очистка старых/ненужных данных из базы каждые 24 часа"""
     while True:
         try:
-            # 1. Удаление нулевых или отрицательных записей из инвентаря
             cursor.execute("DELETE FROM inventory WHERE quantity <= 0")
-
-            # 2. Очистка старой истории транзакций (старше 30 дней)
             cutoff_date = (datetime.now() - timedelta(days=30)).strftime("%d.%m.%Y")
             cursor.execute("DELETE FROM history WHERE date < ?", (cutoff_date,))
-
             db.commit()
-            print("Очистка базы данных завершена (удалены нулевые предметы и устаревшая история).")
+            print("Очистка базы данных завершена.")
             trigger_github_upload()
         except Exception as e:
             print(f"Ошибка при автоматической очистке БД: {e}")
 
-        # Запуск очистки раз в сутки (24 часа = 86400 сек)
         await asyncio.sleep(86400)
 
 
 async def main():
-    # Запускаем веб-сервер
     await start_web_server()
-    
-    # Запускаем автопинг Render
     asyncio.create_task(auto_ping_task())
-    
-    # Запускаем ежедневную рассылку в 19:00 по Киеву
     asyncio.create_task(daily_ladushki_task())
-    
-    # Запускаем авто-очистку мусорных данных из БД
     asyncio.create_task(cleanup_db_task())
     
-    # Очищаем вебхук и запускаем polling
     await bot.delete_webhook(drop_pending_updates=True)
     print("Бот успешно запущен и ожидает сообщений!")
     await dp.start_polling(bot)
