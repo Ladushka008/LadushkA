@@ -81,7 +81,7 @@ def _sync_download():
 
 
 def _sync_upload():
-    """Загружает базу данных в GitHub с обработкой SHA-хэша"""
+    """Мгновенно загружает актуальную версию базы данных в GitHub"""
     if not GITHUB_TOKEN or not GITHUB_REPO:
         return False
 
@@ -100,13 +100,14 @@ def _sync_upload():
     try:
         content_b64 = base64.b64encode(content_bytes).decode("utf-8")
 
+        # Всегда запрашиваем свежий SHA для предотвращения ошибок 409 Conflict
         sha = None
         get_resp = requests.get(url, headers=headers, params={"ref": BRANCH}, timeout=10)
         if get_resp.status_code == 200:
             sha = get_resp.json().get("sha")
 
         data = {
-            "message": "Auto-update database.db [Instant Save]",
+            "message": f"Auto-update database.db [{datetime.now().strftime('%H:%M:%S')}]",
             "content": content_b64,
             "branch": BRANCH
         }
@@ -126,7 +127,7 @@ def _sync_upload():
 
 
 def save_db_changes():
-    """Принудительное сохранение измененного файла в GitHub"""
+    """Принудительное и мгновенное сохранение изменений в GitHub"""
     asyncio.create_task(asyncio.to_thread(_sync_upload))
 
 
@@ -213,6 +214,7 @@ def register_user(user):
             (user.username, user.full_name, user.id)
         )
         db.commit()
+    save_db_changes()
 
 
 def get_balance(user_id):
@@ -468,13 +470,16 @@ async def make_duel_hit(message: Message):
         return
 
     reset_duel_timer(message.chat.id)
-    attacker = p1 if sender.id == p1.id else p2
+    
+    # Определяем кто атакует и кто защищается
+    attacker = sender
     defender = p2 if sender.id == p1.id else p1
 
     attacker_mention = get_user_mention(attacker)
     defender_mention = get_user_mention(defender)
 
-    is_finish = random.random() < 0.25
+    # Вероятность 30% нокаута
+    is_finish = random.random() < 0.30
 
     if is_finish:
         cancel_duel_timer()
@@ -492,12 +497,13 @@ async def make_duel_hit(message: Message):
 
         text = (
             f"💥 {attacker_mention} мощно врезал ладушкой по {defender_mention}!\n\n"
-            f"🏆 <b>Победитель:</b>\n{attacker_mention}\n\n"
+            f"🏆 <b>Победитель:</b> {attacker_mention}\n\n"
             f"💰 {attacker_mention} получает {stolen} ладушки.\n"
             f"💸 {defender_mention} теряет {stolen} ладушки."
         )
         await message.answer(text, disable_web_page_preview=True)
     else:
+        # Передаем ход сопернику
         active_duel["current_turn"] = defender.id
         text = (
             f"👏 {attacker_mention} ударил ладушкой {defender_mention}!\n\n"
