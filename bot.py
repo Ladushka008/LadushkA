@@ -759,7 +759,9 @@ async def transfer_one_ladushka(message: Message):
     )
 
 
-@dp.message(Command("топ богачей"))
+from aiogram import F
+
+@dp.message(F.text.lower() == "топ богачей")
 async def top_players(message: Message):
     cursor.execute("""
         SELECT user_id, full_name, username, balance
@@ -780,7 +782,6 @@ async def top_players(message: Message):
         text += f"{i}. <a href='{url}'>{name}</a> — 🪙 <b>{bal}</b>\n"
 
     await message.answer(text, disable_web_page_preview=True)
-
 
 @dp.message(Command("history"))
 async def history(message: Message):
