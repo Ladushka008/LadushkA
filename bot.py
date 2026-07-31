@@ -775,7 +775,7 @@ async def top_players(message: Message):
         await message.answer("Пока нет участников.")
         return
 
-    text = "💰 <b>Топ богачей</b>\n\n"
+    text = "🏆 <b>Топ по ладушкам</b>\n\n"
     for i, row in enumerate(rows, start=1):
         uid, name, uname, bal = row
         url = f"https://t.me/{uname}" if uname else f"tg://user?id={uid}"
