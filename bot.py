@@ -235,7 +235,7 @@ def get_user_mention(user):
 
 def get_total_items_count(user_id):
     """Возвращает общее количество всех предметов у пользователя"""
-    cursor.execute("SELECT SUM(quantity) FROM inventory WHERE user_id=?", (user_id,))
+    cursor.execute("SELECT SUM(quantity) FROM inventory WHERE user_id=? AND quantity > 0", (user_id,))
     row = cursor.fetchone()
     return row[0] if row and row[0] is not None else 0
 
@@ -311,6 +311,7 @@ async def start(message: Message):
         "• Напишите <b>бонус</b> — чтобы получить ежедневный бонус.\n"
         "• Напишите <b>магазин</b> — чтобы открыть магазин предметов.\n"
         "• Напишите <b>инвентарь</b> — чтобы посмотреть свои предметы.\n"
+        "• Напишите <b>крыса</b> — запустить крысу украсть ладушки у случайного игрока.\n"
         "• Ответьте на сообщение текстом <b>дать 50</b> — чтобы перевести ладушки.\n"
         "• Ответьте на сообщение текстом <b>ударить ладушкой</b> — применить Боевую ладушку.\n"
         "• Ответьте на сообщение текстом <b>кинуть томат</b> — бросить томат в участника."
@@ -408,10 +409,12 @@ async def shop_handler(message: Message):
     text = (
         "🛒 <b>Магазин Ладушек</b>\n\n"
         "🥊 <b>Боевая ладушка</b> — 200 ладушек\n"
-        "🍅 <b>Томат</b> — 100 ладушек\n\n"
+        "🍅 <b>Томат</b> — 100 ладушек\n"
+        "🐀 <b>Крыса</b> — 250 ладушек\n\n"
         "Для покупки:\n"
         "<code>купить ладушка</code>\n"
-        "<code>купить томат</code>"
+        "<code>купить томат</code>\n"
+        "<code>купить крыса</code>"
     )
     await message.answer(text)
 
@@ -472,6 +475,34 @@ async def buy_tomato(message: Message):
     )
 
 
+@dp.message(F.text.lower() == "купить крыса")
+async def buy_rat(message: Message):
+    user = message.from_user
+    register_user(user)
+    
+    price = 250
+    user_bal = get_balance(user.id)
+
+    if user_bal < price:
+        await message.reply(
+            f"❌ <b>Недостаточно ладушек.</b>\n\n"
+            f"Ваш баланс: <b>{user_bal}</b> ладушек"
+        )
+        return
+
+    cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (price, user.id))
+    db.commit()
+    
+    add_item(user.id, "rat", 1)
+    add_history(user.id, 0, price, "buy_item", "Крыса")
+
+    await message.reply(
+        "✅ <b>Покупка успешна!</b>\n\n"
+        "🐀 <b>Получено:</b> Крыса ×1\n"
+        f"💰 <b>Списано:</b> {price} ладушек"
+    )
+
+
 @dp.message(F.text.lower() == "инвентарь")
 async def inventory_handler(message: Message):
     user = message.from_user
@@ -490,6 +521,8 @@ async def inventory_handler(message: Message):
             text += f"🥊 <b>Боевая ладушка</b> ×{quantity}\n"
         elif item_name == "tomato":
             text += f"🍅 <b>Томат</b> ×{quantity}\n"
+        elif item_name == "rat":
+            text += f"🐀 <b>Крыса</b> ×{quantity}\n"
         else:
             text += f"📦 <b>{item_name}</b> ×{quantity}\n"
 
@@ -564,6 +597,65 @@ async def throw_tomato(message: Message):
 
     selected_phrase = random.choice(phrases)
     await message.reply(selected_phrase, disable_web_page_preview=True)
+
+
+# --- ПРЕДМЕТ: КРЫСА ---
+
+@dp.message(F.text.lower() == "крыса")
+async def use_rat(message: Message):
+    sender = message.from_user
+    register_user(sender)
+
+    count = get_item_quantity(sender.id, "rat")
+    if count <= 0:
+        await message.reply("❌ У вас нет крысы.")
+        return
+
+    # Выбираем случайную цель из зарегистрированных пользователей (исключая самого игрока)
+    cursor.execute("SELECT user_id, full_name, balance FROM users WHERE user_id != ?", (sender.id,))
+    targets = cursor.fetchall()
+
+    if not targets:
+        await message.reply("❌ Недостаточно игроков в группе.")
+        return
+
+    target_id, target_name, target_bal = random.choice(targets)
+
+    # Используем и списываем крысу
+    remove_item(sender.id, "rat", 1)
+
+    wanted_steal = random.randint(1, 3)
+
+    if target_bal <= 0:
+        await message.reply(
+            f"🐀 Крыса обыскала карманы {target_name}...\n\n"
+            f"😢 Но там не оказалось ни одной ладушки."
+        )
+    elif target_bal < wanted_steal:
+        stolen = target_bal
+        cursor.execute("UPDATE users SET balance = 0 WHERE user_id=?", (target_id,))
+        cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (stolen, sender.id))
+        db.commit()
+        trigger_github_upload()
+        add_history(target_id, sender.id, stolen, "rat_steal")
+
+        await message.reply(
+            f"🐀 Крыса пробралась к {target_name}!\n\n"
+            f"💸 У {target_name} было только {target_bal} ладушки.\n"
+            f"Крыса украла всё что смогла: {stolen} ладушки."
+        )
+    else:
+        stolen = wanted_steal
+        cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (stolen, target_id))
+        cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (stolen, sender.id))
+        db.commit()
+        trigger_github_upload()
+        add_history(target_id, sender.id, stolen, "rat_steal")
+
+        await message.reply(
+            f"🐀 Крыса пробралась к {target_name}!\n\n"
+            f"💸 Украдено: {stolen} ладушки"
+        )
 
 
 # --- ДЕНЕЖНЫЕ ПЕРЕВОДЫ ---
@@ -781,7 +873,67 @@ async def remove_reputation(message: Message):
     )
 
 
-# --- Админские команды ---
+# --- АДМИНСКИЕ КОМАНДЫ И НОВАЯ СИСТЕМА ШТРАФОВ ---
+
+@dp.message(F.text.lower().startswith("штраф"))
+async def fine_handler(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    if not message.reply_to_message:
+        await message.reply("❌ Ответьте на сообщение игрока.")
+        return
+
+    target = message.reply_to_message.from_user
+    if target.is_bot:
+        await message.reply("🤖 Бота нельзя штрафовать.")
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.reply("⚠️ Укажите сумму штрафа числом. Пример: <code>штраф 10</code>")
+        return
+
+    fine_amount = int(parts[1])
+    register_user(target)
+
+    current_bal = get_balance(target.id)
+
+    if current_bal <= 0:
+        await message.reply(
+            "🚔 Штраф не удалось взыскать.\n\n"
+            "😅 У игрока нет ладушек для списания."
+        )
+        return
+
+    if current_bal < fine_amount:
+        deducted = current_bal
+        cursor.execute("UPDATE users SET balance = 0 WHERE user_id=?", (target.id,))
+        db.commit()
+        trigger_github_upload()
+        add_history(ADMIN_ID, target.id, deducted, "fine")
+
+        await message.reply(
+            f"🚔 Администратор выписал штраф.\n\n"
+            f"👤 Игрок: {target.full_name}\n"
+            f"💸 У игрока было только {current_bal} ладушек.\n\n"
+            f"Списано: {deducted} ладушек\n\n"
+            f"Баланс: 0 ладушек"
+        )
+    else:
+        new_bal = current_bal - fine_amount
+        cursor.execute("UPDATE users SET balance = ? WHERE user_id=?", (new_bal, target.id))
+        db.commit()
+        trigger_github_upload()
+        add_history(ADMIN_ID, target.id, fine_amount, "fine")
+
+        await message.reply(
+            f"🚔 Администратор выписал штраф.\n\n"
+            f"👤 Игрок: {target.full_name}\n"
+            f"💸 Штраф: {fine_amount} ладушек\n\n"
+            f"Новый баланс: {new_bal} ладушек"
+        )
+
 
 @dp.message(Command("add"))
 async def add_balance(message: Message):
@@ -847,27 +999,6 @@ async def set_balance(message: Message):
     await message.answer("✅ Баланс изменён.")
 
 
-@dp.message(Command("fine"))
-async def fine(message: Message):
-    if not is_admin(message.from_user.id) or not message.reply_to_message:
-        return
-    args = message.text.split()
-    if len(args) < 2:
-        return
-    try:
-        amount = int(args[1])
-    except ValueError:
-        return
-
-    user = message.reply_to_message.from_user
-    cursor.execute("UPDATE users SET balance = MAX(balance-?,0) WHERE user_id=?", (amount, user.id))
-    db.commit()
-    trigger_github_upload()
-
-    user_link = get_user_mention(user)
-    await message.answer(f"⚠️ Игрок {user_link} получил штраф {amount} ладушек.", disable_web_page_preview=True)
-
-
 @dp.message(Command("admin_bonus"))
 async def admin_bonus(message: Message):
     if not is_admin(message.from_user.id) or not message.reply_to_message:
@@ -902,7 +1033,7 @@ async def reset(message: Message):
 
 
 # ==========================
-# ВЕБ-СЕРВЕР, АВТОПИНГ И РАССЫЛКА
+# ВЕБ-СЕРВЕР, АВТОПИНГ, ОЧИСТКА БД И РАССЫЛКА
 # ==========================
 
 async def handle_ping(request):
@@ -974,6 +1105,27 @@ async def daily_ladushki_task():
             print(f"Ошибка при отправке ежедневного сообщения: {e}")
 
 
+async def cleanup_db_task():
+    """Фоновая задача: регулярная очистка старых/ненужных данных из базы каждые 24 часа"""
+    while True:
+        try:
+            # 1. Удаление нулевых или отрицательных записей из инвентаря
+            cursor.execute("DELETE FROM inventory WHERE quantity <= 0")
+
+            # 2. Очистка старой истории транзакций (старше 30 дней)
+            cutoff_date = (datetime.now() - timedelta(days=30)).strftime("%d.%m.%Y")
+            cursor.execute("DELETE FROM history WHERE date < ?", (cutoff_date,))
+
+            db.commit()
+            print("Очистка базы данных завершена (удалены нулевые предметы и устаревшая история).")
+            trigger_github_upload()
+        except Exception as e:
+            print(f"Ошибка при автоматической очистке БД: {e}")
+
+        # Запуск очистки раз в сутки (24 часа = 86400 сек)
+        await asyncio.sleep(86400)
+
+
 async def main():
     # Запускаем веб-сервер
     await start_web_server()
@@ -983,6 +1135,9 @@ async def main():
     
     # Запускаем ежедневную рассылку в 19:00 по Киеву
     asyncio.create_task(daily_ladushki_task())
+    
+    # Запускаем авто-очистку мусорных данных из БД
+    asyncio.create_task(cleanup_db_task())
     
     # Очищаем вебхук и запускаем polling
     await bot.delete_webhook(drop_pending_updates=True)
