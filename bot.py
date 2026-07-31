@@ -403,7 +403,7 @@ async def accept_duel_callback(callback: CallbackQuery):
     await callback.message.edit_text(
         f"⚔️ <b>Дуэль началась!</b>\n\n"
         f"🎯 Первым ходит: {first_mention}\n\n"
-        f"Чтобы ударить, напишите:\n<code>подарок</code>",
+        f"Чтобы ударить, напишите:\n<code>удар</code>",
         disable_web_page_preview=True
     )
     await callback.answer()
@@ -435,6 +435,64 @@ async def decline_duel_callback(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.message(F.text.lower().in_(["удар", "ударить"]))
+async def make_duel_hit(message: Message):
+    global active_duel
+
+    if not active_duel or active_duel["status"] != "active":
+        return
+
+    sender = message.from_user
+    p1 = active_duel["challenger"]
+    p2 = active_duel["opponent"]
+
+    if sender.id not in [p1.id, p2.id]:
+        return
+
+    if sender.id != active_duel["current_turn"]:
+        await message.reply("⏳ Сейчас не ваш ход.")
+        return
+
+    reset_duel_timer(message.chat.id)
+    attacker = p1 if sender.id == p1.id else p2
+    defender = p2 if sender.id == p1.id else p1
+
+    attacker_mention = get_user_mention(attacker)
+    defender_mention = get_user_mention(defender)
+
+    is_finish = random.random() < 0.25
+
+    if is_finish:
+        cancel_duel_timer()
+        def_bal = get_balance(defender.id)
+        stolen = min(def_bal, 3)
+
+        if stolen > 0:
+            with db_lock:
+                cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (stolen, defender.id))
+                cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (stolen, attacker.id))
+                db.commit()
+            add_history(defender.id, attacker.id, stolen, "duel_win")
+
+        active_duel = None
+
+        text = (
+            f"💥 {attacker_mention} мощно врезал ладушкой по {defender_mention}!\n\n"
+            f"🏆 <b>Победитель:</b>\n{attacker_mention}\n\n"
+            f"💰 {attacker_mention} получает {stolen} ладушки.\n"
+            f"💸 {defender_mention} теряет {stolen} ладушки."
+        )
+        await message.answer(text, disable_web_page_preview=True)
+    else:
+        active_duel["current_turn"] = defender.id
+        text = (
+            f"👏 {attacker_mention} ударил ладушкой {defender_mention}!\n\n"
+            f"🎯 Теперь ходит:\n{defender_mention}\n\n"
+            f"Напишите:\n<code>удар</code>"
+        )
+        await message.answer(text, disable_web_page_preview=True)
+
+
 # ==========================
 # ОСНОВНЫЕ ХЕНДЛЕРЫ
 # ==========================
@@ -458,7 +516,7 @@ async def start(message: Message):
         "• Напишите <b>инвентарь</b> — чтобы посмотреть свои предметы.\n"
         "• Напишите <b>репутация</b> — чтобы увидеть ТОП-5 по репутации.\n"
         "• Напишите <b>крыса</b> — запустить крысу украсть ладушки у случайного игрока.\n"
-        "• Ответьте на сообщение текстом <b>подарок</b> — чтобы подарить 1 ладушку.\n"
+        "• Ответьте на сообщение текстом <b>подарок</b> или <b>ладошка</b> — чтобы передать 1 ладушку игроку.\n"
         "• Ответьте на сообщение текстом <b>дать 50</b> — чтобы перевести ладушки.\n"
         "• Ответьте на сообщение текстом <b>ударить ладушкой</b> — применить Боевую ладушку.\n"
         "• Ответьте на сообщение текстом <b>кинуть томат</b> — бросить томат в участника."
@@ -783,7 +841,7 @@ async def use_rat(message: Message):
         await message.reply(f"🐀 Крыса пробралась к {target_name}!\n\n💸 Украдено: {stolen} ладушки")
 
 
-# --- ДЕНЕЖНЫЕ ПЕРЕВОДЫ И ХОДЫ В ДУЭЛИ ---
+# --- ДЕНЕЖНЫЕ ПЕРЕВОДЫ И ПОДАРКИ (ЛАДОШКИ) ---
 
 @dp.message(F.text.lower().startswith("дать "))
 async def transfer_custom_amount(message: Message):
@@ -841,68 +899,19 @@ async def transfer_custom_amount(message: Message):
     )
 
 
-@dp.message(F.text.lower() == "подарок")
+@dp.message(F.text.lower().in_(["подарок", "ладошка"]))
 async def transfer_one_ladushka(message: Message):
-    global active_duel
-
     sender = message.from_user
 
-    if active_duel and active_duel["status"] == "active":
-        p1 = active_duel["challenger"]
-        p2 = active_duel["opponent"]
-
-        if sender.id not in [p1.id, p2.id]:
-            return
-
-        if sender.id != active_duel["current_turn"]:
-            await message.reply("⏳ Сейчас не ваш ход.")
-            return
-
-        reset_duel_timer(message.chat.id)
-        attacker = p1 if sender.id == p1.id else p2
-        defender = p2 if sender.id == p1.id else p1
-
-        attacker_mention = get_user_mention(attacker)
-        defender_mention = get_user_mention(defender)
-
-        is_finish = random.random() < 0.25
-
-        if is_finish:
-            cancel_duel_timer()
-            def_bal = get_balance(defender.id)
-            stolen = min(def_bal, 3)
-
-            if stolen > 0:
-                with db_lock:
-                    cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (stolen, defender.id))
-                    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (stolen, attacker.id))
-                    db.commit()
-                add_history(defender.id, attacker.id, stolen, "duel_win")
-
-            active_duel = None
-
-            text = (
-                f"💥 {attacker_mention} мощно врезал ладушкой по {defender_mention}!\n\n"
-                f"🏆 <b>Победитель:</b>\n{attacker_mention}\n\n"
-                f"💰 {attacker_mention} получает {stolen} ладушки.\n"
-                f"💸 {defender_mention} теряет {stolen} ладушки."
-            )
-            await message.answer(text, disable_web_page_preview=True)
-            return
-        else:
-            active_duel["current_turn"] = defender.id
-            text = (
-                f"👏 {attacker_mention} ударил ладушкой {defender_mention}!\n\n"
-                f"🎯 Теперь ходит:\n{defender_mention}\n\n"
-                f"Напишите:\n<code>подарок</code>"
-            )
-            await message.answer(text, disable_web_page_preview=True)
-            return
-
     if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.reply("⚠️ Ответьте на сообщение игрока, чтобы передать ладушку!")
         return
 
     receiver = message.reply_to_message.from_user
+
+    if receiver.is_bot:
+        await message.reply("🤖 Нельзя передавать ладушки боту.")
+        return
 
     if sender.id == receiver.id:
         await message.reply("❌ Нельзя дарить ладушки самому себе.")
@@ -928,7 +937,7 @@ async def transfer_one_ladushka(message: Message):
     receiver_mention = get_user_mention(receiver)
 
     await message.reply(
-        f"🎁 <b>Подарок отправлен!</b>\n\n"
+        f"🎁 <b>Ладушка передана!</b>\n\n"
         f"От: {sender_mention}\n"
         f"Кому: {receiver_mention}\n"
         f"Передано: <b>1 ладушка</b> 🪙\n\n"
@@ -1129,7 +1138,7 @@ async def fine_handler(message: Message):
     else:
         new_bal = current_bal - fine_amount
         with db_lock:
-            cursor.execute("UPDATE users SET balance = ? WHERE user_id=?", (new_bal, target.id))
+            cursor.execute("UPDATE users SET balance = ? WHERE user_id=?", (target.id,), (new_bal,))
             db.commit()
         add_history(ADMIN_ID, target.id, fine_amount, "fine")
 
