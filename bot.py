@@ -47,7 +47,7 @@ active_duel = None
 
 
 # ==========================
-# GITHUB СИНХРОНИЗАЦИЯ (ЖЕЛЕЗНАЯ ЛОГИКА)
+# GITHUB СИНХРОНИЗАЦИЯ
 # ==========================
 
 def _sync_download():
@@ -100,7 +100,6 @@ def _sync_upload():
     try:
         content_b64 = base64.b64encode(content_bytes).decode("utf-8")
 
-        # Получаем актуальный SHA перед записью, чтобы избегать 409 Conflict
         sha = None
         get_resp = requests.get(url, headers=headers, params={"ref": BRANCH}, timeout=10)
         if get_resp.status_code == 200:
@@ -135,15 +134,16 @@ def save_db_changes():
 # ИНИЦИАЛИЗАЦИЯ И РАБОТА С БД
 # ==========================
 
-def init_db():
+async def init_db():
     global db, cursor
-    # Скачиваем последнюю копию из GitHub
-    _sync_download()
+    # Скачиваем последнюю копию из GitHub в фоновом потоке
+    await asyncio.to_thread(_sync_download)
 
     db = sqlite3.connect(DB_FILE, check_same_thread=False)
     cursor = db.cursor()
 
     with db_lock:
+        cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS users(
             user_id INTEGER PRIMARY KEY,
@@ -186,9 +186,6 @@ def init_db():
         )
         """)
         db.commit()
-
-
-init_db()
 
 
 # ==========================
@@ -332,7 +329,7 @@ async def start_duel_request(message: Message):
     global active_duel
 
     if active_duel is not None:
-        await message.reply("⚔️ Сейчас уже идёт дуэль. Дождитесь её окончания или отмените командой `отмена дуэли`.")
+        await message.reply("⚔️ Сейчас уже идёт дуэль. Дождитесь её окончания или отмените командой <code>отмена дуэли</code>.")
         return
 
     if not message.reply_to_message or not message.reply_to_message.from_user:
@@ -647,14 +644,13 @@ async def buy_battle_ladushka(message: Message):
     register_user(user)
     
     price = 200
-    user_bal = get_balance(user.id)
-
-    if user_bal < price:
-        await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{user_bal}</b> ладушек")
-        return
-
+    
     with db_lock:
-        cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (price, user.id))
+        cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (price, user.id, price))
+        if cursor.rowcount == 0:
+            user_bal = get_balance(user.id)
+            await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{user_bal}</b> ладушек")
+            return
         db.commit()
     
     add_item(user.id, "battle_ladushka", 1)
@@ -673,14 +669,13 @@ async def buy_tomato(message: Message):
     register_user(user)
     
     price = 100
-    user_bal = get_balance(user.id)
-
-    if user_bal < price:
-        await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{user_bal}</b> ладушек")
-        return
 
     with db_lock:
-        cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (price, user.id))
+        cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (price, user.id, price))
+        if cursor.rowcount == 0:
+            user_bal = get_balance(user.id)
+            await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{user_bal}</b> ладушек")
+            return
         db.commit()
     
     add_item(user.id, "tomato", 1)
@@ -699,14 +694,13 @@ async def buy_rat(message: Message):
     register_user(user)
     
     price = 250
-    user_bal = get_balance(user.id)
-
-    if user_bal < price:
-        await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{user_bal}</b> ладушек")
-        return
 
     with db_lock:
-        cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (price, user.id))
+        cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (price, user.id, price))
+        if cursor.rowcount == 0:
+            user_bal = get_balance(user.id)
+            await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{user_bal}</b> ладушек")
+            return
         db.commit()
     
     add_item(user.id, "rat", 1)
@@ -887,14 +881,13 @@ async def transfer_custom_amount(message: Message):
     register_user(sender)
     register_user(receiver)
 
-    sender_balance = get_balance(sender.id)
-
-    if sender_balance < amount:
-        await message.reply(f"❌ <b>Недостаточно средств!</b>\nУ вас на балансе: <b>{sender_balance}</b> ладушек.")
-        return
-
     with db_lock:
-        cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (amount, sender.id))
+        cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (amount, sender.id, amount))
+        if cursor.rowcount == 0:
+            sender_balance = get_balance(sender.id)
+            await message.reply(f"❌ <b>Недостаточно средств!</b>\nУ вас на балансе: <b>{sender_balance}</b> ладушек.")
+            return
+
         cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, receiver.id))
         db.commit()
 
@@ -938,14 +931,12 @@ async def transfer_one_ladushka(message: Message):
     register_user(sender)
     register_user(receiver)
 
-    sender_balance = get_balance(sender.id)
-
-    if sender_balance < 1:
-        await message.reply("❌ У вас нет ладушек.")
-        return
-
     with db_lock:
-        cursor.execute("UPDATE users SET balance = balance - 1 WHERE user_id=?", (sender.id,))
+        cursor.execute("UPDATE users SET balance = balance - 1 WHERE user_id=? AND balance >= 1", (sender.id,))
+        if cursor.rowcount == 0:
+            await message.reply("❌ У вас нет ладушек.")
+            return
+
         cursor.execute("UPDATE users SET balance = balance + 1 WHERE user_id=?", (receiver.id,))
         db.commit()
 
@@ -1346,9 +1337,7 @@ async def cleanup_db_task():
     while True:
         try:
             with db_lock:
-                # Очищаем недействительный инвентарь
                 cursor.execute("DELETE FROM inventory WHERE quantity <= 0")
-                # Очищаем историю старше 14 дней для уменьшения размера БД
                 cutoff_date = (datetime.now() - timedelta(days=14)).strftime("%Y-%m-%d %H:%M:%S")
                 cursor.execute("DELETE FROM history WHERE date < ?", (cutoff_date,))
                 db.commit()
@@ -1361,13 +1350,14 @@ async def cleanup_db_task():
 
 
 async def main():
+    await init_db()
     await start_web_server()
     asyncio.create_task(auto_ping_task())
     asyncio.create_task(daily_ladushki_task())
     asyncio.create_task(cleanup_db_task())
     
     await bot.delete_webhook(drop_pending_updates=True)
-    print("🚀 Бот успешно запущен и готове к работе!")
+    print("🚀 Бот успешно запущен и готов к работе!")
     await dp.start_polling(bot)
 
 
