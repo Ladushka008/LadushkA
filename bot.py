@@ -95,6 +95,7 @@ def _sync_upload():
             content_bytes = f.read()
         content_b64 = base64.b64encode(content_bytes).decode("utf-8")
 
+        # Всегда получаем актуальный SHA файла с GitHub перед загрузкой
         sha = None
         get_resp = requests.get(url, headers=headers, params={"ref": BRANCH}, timeout=10)
         if get_resp.status_code == 200:
@@ -110,10 +111,10 @@ def _sync_upload():
 
         put_resp = requests.put(url, headers=headers, json=data, timeout=10)
         if put_resp.status_code in [200, 201]:
-            print("Database uploaded to GitHub")
+            print("Database uploaded to GitHub successfully")
             return True
         else:
-            print(f"GitHub sync upload failed: {put_resp.status_code}")
+            print(f"GitHub sync upload failed: {put_resp.status_code} - {put_resp.text}")
             return False
     except Exception as e:
         print(f"GitHub sync upload error: {e}")
@@ -209,7 +210,6 @@ def register_user(user):
         (user.username, user.full_name, user.id)
     )
     db.commit()
-    trigger_github_upload()
 
 
 def get_balance(user_id):
@@ -221,7 +221,7 @@ def get_balance(user_id):
 def get_reputation(user_id):
     cursor.execute("SELECT reputation FROM users WHERE user_id=?", (user_id,))
     row = cursor.fetchone()
-    return row[0] if row else 0
+    return row[0] if row and row[0] is not None else 0
 
 
 def get_user_mention(user):
@@ -431,7 +431,6 @@ async def buy_battle_ladushka(message: Message):
         )
         return
 
-    # Списываем средства и добавляем предмет
     cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (price, user.id))
     db.commit()
     
@@ -460,7 +459,6 @@ async def buy_tomato(message: Message):
         )
         return
 
-    # Списываем средства и добавляем предмет
     cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (price, user.id))
     db.commit()
     
@@ -518,13 +516,11 @@ async def hit_with_ladushka(message: Message):
         )
         return
 
-    # Списываем 1 предмет
     remove_item(sender.id, "battle_ladushka", 1)
 
     sender_link = get_user_mention(sender)
     receiver_link = get_user_mention(receiver)
 
-    # Варианты сообщений
     phrases = [
         f"🥊 {sender_link} ударил ладушкой {receiver_link}!\n\n👏 <b>ШЛЁП!</b>",
         f"💥 {sender_link} размахнулся и влепил ладушку {receiver_link}!",
@@ -555,13 +551,11 @@ async def throw_tomato(message: Message):
         )
         return
 
-    # Списываем 1 томат
     remove_item(sender.id, "tomato", 1)
 
     sender_link = get_user_mention(sender)
     receiver_link = get_user_mention(receiver)
 
-    # Варианты сообщений
     phrases = [
         f"🍅 {sender_link} кинул томат в {receiver_link}!\n\n🤭 Теперь {receiver_link} весь в томате.",
         f"🍅 {sender_link} запустил томат в {receiver_link}!\n\n💥 Прямое попадание!\n\n😂 {receiver_link} весь в кетчупе.",
@@ -609,7 +603,6 @@ async def transfer_custom_amount(message: Message):
         )
         return
 
-    # Перевод
     cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (amount, sender.id))
     cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, receiver.id))
     db.commit()
