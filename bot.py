@@ -143,7 +143,8 @@ def init_db():
         full_name TEXT,
         balance INTEGER DEFAULT 0,
         last_bonus TEXT,
-        created_at TEXT
+        created_at TEXT,
+        reputation INTEGER DEFAULT 0
     )
     """)
 
@@ -154,6 +155,8 @@ def init_db():
         cursor.execute("ALTER TABLE users ADD COLUMN last_bonus TEXT")
     if "created_at" not in columns:
         cursor.execute("ALTER TABLE users ADD COLUMN created_at TEXT")
+    if "reputation" not in columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN reputation INTEGER DEFAULT 0")
 
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS history(
@@ -191,8 +194,8 @@ def register_user(user):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cursor.execute(
         """
-        INSERT OR IGNORE INTO users(user_id, username, full_name, balance, last_bonus, created_at)
-        VALUES(?,?,?,0,NULL,?)
+        INSERT OR IGNORE INTO users(user_id, username, full_name, balance, last_bonus, created_at, reputation)
+        VALUES(?,?,?,0,NULL,?,0)
         """,
         (user.id, user.username, user.full_name, now_str)
     )
@@ -211,6 +214,12 @@ def register_user(user):
 
 def get_balance(user_id):
     cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    return row[0] if row else 0
+
+
+def get_reputation(user_id):
+    cursor.execute("SELECT reputation FROM users WHERE user_id=?", (user_id,))
     row = cursor.fetchone()
     return row[0] if row else 0
 
@@ -317,28 +326,13 @@ async def profile_handler(message: Message):
 
     user_balance = get_balance(target.id)
     items_count = get_total_items_count(target.id)
-
-    # Получение даты регистрации
-    cursor.execute("SELECT created_at FROM users WHERE user_id=?", (target.id,))
-    row = cursor.fetchone()
-    created_at_str = row[0] if row else None
-
-    if created_at_str:
-        try:
-            created_date = datetime.strptime(created_at_str, "%Y-%m-%d %H:%M:%S")
-            days_in_bot = (datetime.now() - created_date).days
-            if days_in_bot < 1:
-                days_in_bot = 1  # Если меньше дня, показываем 1
-        except Exception:
-            days_in_bot = 1
-    else:
-        days_in_bot = 1
+    user_rep = get_reputation(target.id)
 
     text = (
         f"👤 <b>Имя:</b> {target.full_name}\n\n"
         f"💰 <b>Баланс:</b> {user_balance} ладушек\n\n"
         f"🎒 <b>Предметов:</b> {items_count}\n\n"
-        f"📅 <b>В боте:</b> {days_in_bot} дней"
+        f"⭐ <b>Репутация:</b> {user_rep}/10"
     )
 
     await message.answer(text, disable_web_page_preview=True)
@@ -722,6 +716,76 @@ async def history(message: Message):
         text += f"• {action} | {amount} 🪙 | {date}\n"
 
     await message.answer(text)
+
+
+# --- СИСТЕМА РЕПУТАЦИИ (ТОЛЬКО ДЛЯ АДМИНОВ) ---
+
+@dp.message(F.text.lower() == "+реп")
+async def add_reputation(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    if not message.reply_to_message:
+        await message.reply("❌ Ответьте на сообщение пользователя.")
+        return
+
+    target = message.reply_to_message.from_user
+
+    if target.is_bot:
+        await message.reply("🤖 Боту нельзя выдавать репутацию.")
+        return
+
+    register_user(target)
+    current_rep = get_reputation(target.id)
+
+    if current_rep >= 10:
+        await message.reply("⭐ У этого игрока уже максимальная репутация (10).")
+        return
+
+    new_rep = current_rep + 1
+    cursor.execute("UPDATE users SET reputation=? WHERE user_id=?", (new_rep, target.id))
+    db.commit()
+    trigger_github_upload()
+
+    await message.reply(
+        f"⭐ <b>Репутация выдана!</b>\n\n"
+        f"👤 <b>Игрок:</b> {target.full_name}\n"
+        f"➕ <b>Репутация:</b> +1"
+    )
+
+
+@dp.message(F.text.lower() == "-реп")
+async def remove_reputation(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    if not message.reply_to_message:
+        await message.reply("❌ Ответьте на сообщение пользователя.")
+        return
+
+    target = message.reply_to_message.from_user
+
+    if target.is_bot:
+        await message.reply("🤖 Боту нельзя выдавать репутацию.")
+        return
+
+    register_user(target)
+    current_rep = get_reputation(target.id)
+
+    if current_rep <= 0:
+        await message.reply("⭐ У этого игрока уже минимальная репутация (0).")
+        return
+
+    new_rep = current_rep - 1
+    cursor.execute("UPDATE users SET reputation=? WHERE user_id=?", (new_rep, target.id))
+    db.commit()
+    trigger_github_upload()
+
+    await message.reply(
+        f"⭐ <b>Репутация изменена!</b>\n\n"
+        f"👤 <b>Игрок:</b> {target.full_name}\n"
+        f"➖ <b>Репутация:</b> -1"
+    )
 
 
 # --- Админские команды ---
