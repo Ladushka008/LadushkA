@@ -6,6 +6,7 @@ import requests
 import aiohttp
 import zoneinfo
 import random
+import threading
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
@@ -16,19 +17,17 @@ from aiogram.client.default import DefaultBotProperties
 from aiohttp import web
 
 # ==========================
-# НАСТРОЙКИ (Переменные окружения)
+# НАСТРОЙКИ
 # ==========================
 
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7837011810"))
 PORT = int(os.getenv("PORT", 8080))
 
-# Ссылка или ID вашей группы (по умолчанию @ladushka09)
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID", "@ladushka09")
 
-# GitHub настройки
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO = os.getenv("GITHUB_REPO")  # Пример: Ladushka008/LadushkA
+GITHUB_REPO = os.getenv("GITHUB_REPO")
 DB_FILE = "database.db"
 GITHUB_FILE_PATH = "database.db"
 BRANCH = "main"
@@ -41,6 +40,7 @@ bot = Bot(
 dp = Dispatcher()
 db = None
 cursor = None
+db_lock = threading.Lock()
 
 # Глобальное состояние дуэли
 active_duel = None
@@ -66,8 +66,9 @@ def _sync_download():
         if response.status_code == 200:
             content_b64 = response.json().get("content", "")
             file_data = base64.b64decode(content_b64)
-            with open(DB_FILE, "wb") as f:
-                f.write(file_data)
+            with db_lock:
+                with open(DB_FILE, "wb") as f:
+                    f.write(file_data)
             print("Database downloaded from GitHub")
             return True
         else:
@@ -83,9 +84,12 @@ def _sync_upload():
         print("GitHub sync failed: missing token or repo")
         return False
 
-    if not os.path.exists(DB_FILE):
-        print("GitHub sync upload failed: DB file not found")
-        return False
+    with db_lock:
+        if not os.path.exists(DB_FILE):
+            print("GitHub sync upload failed: DB file not found")
+            return False
+        with open(DB_FILE, "rb") as f:
+            content_bytes = f.read()
 
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
     headers = {
@@ -94,8 +98,6 @@ def _sync_upload():
     }
 
     try:
-        with open(DB_FILE, "rb") as f:
-            content_bytes = f.read()
         content_b64 = base64.b64encode(content_bytes).decode("utf-8")
 
         sha = None
@@ -139,49 +141,49 @@ def init_db():
     db = sqlite3.connect(DB_FILE, check_same_thread=False)
     cursor = db.cursor()
 
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users(
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        full_name TEXT,
-        balance INTEGER DEFAULT 0,
-        last_bonus TEXT,
-        created_at TEXT,
-        reputation INTEGER DEFAULT 0
-    )
-    """)
+    with db_lock:
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            full_name TEXT,
+            balance INTEGER DEFAULT 0,
+            last_bonus TEXT,
+            created_at TEXT,
+            reputation INTEGER DEFAULT 0
+        )
+        """)
 
-    cursor.execute("PRAGMA table_info(users)")
-    columns = [column[1] for column in cursor.fetchall()]
-    if "last_bonus" not in columns:
-        cursor.execute("ALTER TABLE users ADD COLUMN last_bonus TEXT")
-    if "created_at" not in columns:
-        cursor.execute("ALTER TABLE users ADD COLUMN created_at TEXT")
-    if "reputation" not in columns:
-        cursor.execute("ALTER TABLE users ADD COLUMN reputation INTEGER DEFAULT 0")
+        cursor.execute("PRAGMA table_info(users)")
+        columns = [column[1] for column in cursor.fetchall()]
+        if "last_bonus" not in columns:
+            cursor.execute("ALTER TABLE users ADD COLUMN last_bonus TEXT")
+        if "created_at" not in columns:
+            cursor.execute("ALTER TABLE users ADD COLUMN created_at TEXT")
+        if "reputation" not in columns:
+            cursor.execute("ALTER TABLE users ADD COLUMN reputation INTEGER DEFAULT 0")
 
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS history(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sender INTEGER,
-        receiver INTEGER,
-        amount INTEGER,
-        action TEXT,
-        reason TEXT,
-        date TEXT
-    )
-    """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS history(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender INTEGER,
+            receiver INTEGER,
+            amount INTEGER,
+            action TEXT,
+            reason TEXT,
+            date TEXT
+        )
+        """)
 
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS inventory(
-        user_id INTEGER,
-        item_name TEXT,
-        quantity INTEGER DEFAULT 0,
-        PRIMARY KEY (user_id, item_name)
-    )
-    """)
-
-    db.commit()
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS inventory(
+            user_id INTEGER,
+            item_name TEXT,
+            quantity INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, item_name)
+        )
+        """)
+        db.commit()
 
 
 init_db()
@@ -195,39 +197,40 @@ def register_user(user):
     if not user:
         return
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cursor.execute(
-        """
-        INSERT OR IGNORE INTO users(user_id, username, full_name, balance, last_bonus, created_at, reputation)
-        VALUES(?,?,?,0,NULL,?,0)
-        """,
-        (user.id, user.username, user.full_name, now_str)
-    )
-
-    cursor.execute(
-        """
-        UPDATE users
-        SET username=?, full_name=?
-        WHERE user_id=?
-        """,
-        (user.username, user.full_name, user.id)
-    )
-    db.commit()
+    with db_lock:
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO users(user_id, username, full_name, balance, last_bonus, created_at, reputation)
+            VALUES(?,?,?,0,NULL,?,0)
+            """,
+            (user.id, user.username, user.full_name, now_str)
+        )
+        cursor.execute(
+            """
+            UPDATE users
+            SET username=?, full_name=?
+            WHERE user_id=?
+            """,
+            (user.username, user.full_name, user.id)
+        )
+        db.commit()
 
 
 def get_balance(user_id):
-    cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-    row = cursor.fetchone()
+    with db_lock:
+        cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+        row = cursor.fetchone()
     return row[0] if row else 0
 
 
 def get_reputation(user_id):
-    cursor.execute("SELECT reputation FROM users WHERE user_id=?", (user_id,))
-    row = cursor.fetchone()
+    with db_lock:
+        cursor.execute("SELECT reputation FROM users WHERE user_id=?", (user_id,))
+        row = cursor.fetchone()
     return row[0] if row and row[0] is not None else 0
 
 
 def get_user_mention(user):
-    """Возвращает имя пользователя со встроенной ссылкой на его профиль"""
     if not user:
         return "Неизвестный"
     if user.username:
@@ -238,27 +241,29 @@ def get_user_mention(user):
 
 
 def get_total_items_count(user_id):
-    cursor.execute("SELECT SUM(quantity) FROM inventory WHERE user_id=? AND quantity > 0", (user_id,))
-    row = cursor.fetchone()
+    with db_lock:
+        cursor.execute("SELECT SUM(quantity) FROM inventory WHERE user_id=? AND quantity > 0", (user_id,))
+        row = cursor.fetchone()
     return row[0] if row and row[0] is not None else 0
 
 
 def add_history(sender, receiver, amount, action, reason=""):
-    cursor.execute(
-        """
-        INSERT INTO history(sender, receiver, amount, action, reason, date)
-        VALUES(?,?,?,?,?,?)
-        """,
-        (
-            sender,
-            receiver,
-            amount,
-            action,
-            reason,
-            datetime.now().strftime("%d.%m.%Y %H:%M")
+    with db_lock:
+        cursor.execute(
+            """
+            INSERT INTO history(sender, receiver, amount, action, reason, date)
+            VALUES(?,?,?,?,?,?)
+            """,
+            (
+                sender,
+                receiver,
+                amount,
+                action,
+                reason,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            )
         )
-    )
-    db.commit()
+        db.commit()
     trigger_github_upload()
 
 
@@ -267,28 +272,31 @@ def is_admin(user_id: int):
 
 
 def get_item_quantity(user_id, item_name):
-    cursor.execute("SELECT quantity FROM inventory WHERE user_id=? AND item_name=?", (user_id, item_name))
-    row = cursor.fetchone()
+    with db_lock:
+        cursor.execute("SELECT quantity FROM inventory WHERE user_id=? AND item_name=?", (user_id, item_name))
+        row = cursor.fetchone()
     return row[0] if row else 0
 
 
 def add_item(user_id, item_name, count=1):
-    cursor.execute("""
-        INSERT INTO inventory (user_id, item_name, quantity)
-        VALUES (?, ?, ?)
-        ON CONFLICT(user_id, item_name) DO UPDATE SET quantity = quantity + ?
-    """, (user_id, item_name, count, count))
-    db.commit()
+    with db_lock:
+        cursor.execute("""
+            INSERT INTO inventory (user_id, item_name, quantity)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, item_name) DO UPDATE SET quantity = quantity + ?
+        """, (user_id, item_name, count, count))
+        db.commit()
     trigger_github_upload()
 
 
 def remove_item(user_id, item_name, count=1):
     current = get_item_quantity(user_id, item_name)
-    if current <= count:
-        cursor.execute("DELETE FROM inventory WHERE user_id=? AND item_name=?", (user_id, item_name))
-    else:
-        cursor.execute("UPDATE inventory SET quantity = quantity - ? WHERE user_id=? AND item_name=?", (count, user_id, item_name))
-    db.commit()
+    with db_lock:
+        if current <= count:
+            cursor.execute("DELETE FROM inventory WHERE user_id=? AND item_name=?", (user_id, item_name))
+        else:
+            cursor.execute("UPDATE inventory SET quantity = quantity - ? WHERE user_id=? AND item_name=?", (count, user_id, item_name))
+        db.commit()
     trigger_github_upload()
 
 
@@ -297,7 +305,6 @@ def remove_item(user_id, item_name, count=1):
 # ==========================
 
 async def duel_timeout_task(chat_id: int):
-    """Таймаут 10 минут на отмену дуэли при неактивности"""
     await asyncio.sleep(600)
     global active_duel
     if active_duel:
@@ -502,8 +509,9 @@ async def get_daily_bonus(message: Message):
     user = message.from_user
     register_user(user)
 
-    cursor.execute("SELECT last_bonus FROM users WHERE user_id=?", (user.id,))
-    row = cursor.fetchone()
+    with db_lock:
+        cursor.execute("SELECT last_bonus FROM users WHERE user_id=?", (user.id,))
+        row = cursor.fetchone()
     last_bonus_str = row[0] if row else None
 
     now = datetime.now()
@@ -524,12 +532,12 @@ async def get_daily_bonus(message: Message):
 
     reward = random.randint(1, 5)
 
-    cursor.execute(
-        "UPDATE users SET balance = balance + ?, last_bonus = ? WHERE user_id=?",
-        (reward, now.isoformat(), user.id)
-    )
-    db.commit()
-    trigger_github_upload()
+    with db_lock:
+        cursor.execute(
+            "UPDATE users SET balance = balance + ?, last_bonus = ? WHERE user_id=?",
+            (reward, now.isoformat(), user.id)
+        )
+        db.commit()
 
     add_history(0, user.id, reward, "daily_bonus")
 
@@ -568,8 +576,9 @@ async def buy_battle_ladushka(message: Message):
         await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{user_bal}</b> ладушек")
         return
 
-    cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (price, user.id))
-    db.commit()
+    with db_lock:
+        cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (price, user.id))
+        db.commit()
     
     add_item(user.id, "battle_ladushka", 1)
     add_history(user.id, 0, price, "buy_item", "Боевая ладушка")
@@ -593,8 +602,9 @@ async def buy_tomato(message: Message):
         await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{user_bal}</b> ладушек")
         return
 
-    cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (price, user.id))
-    db.commit()
+    with db_lock:
+        cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (price, user.id))
+        db.commit()
     
     add_item(user.id, "tomato", 1)
     add_history(user.id, 0, price, "buy_item", "Томат")
@@ -618,8 +628,9 @@ async def buy_rat(message: Message):
         await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{user_bal}</b> ладушек")
         return
 
-    cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (price, user.id))
-    db.commit()
+    with db_lock:
+        cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (price, user.id))
+        db.commit()
     
     add_item(user.id, "rat", 1)
     add_history(user.id, 0, price, "buy_item", "Крыса")
@@ -636,8 +647,9 @@ async def inventory_handler(message: Message):
     user = message.from_user
     register_user(user)
 
-    cursor.execute("SELECT item_name, quantity FROM inventory WHERE user_id=? AND quantity > 0", (user.id,))
-    rows = cursor.fetchall()
+    with db_lock:
+        cursor.execute("SELECT item_name, quantity FROM inventory WHERE user_id=? AND quantity > 0", (user.id,))
+        rows = cursor.fetchall()
 
     if not rows:
         await message.reply("🎒 Ваш инвентарь пуст.")
@@ -731,8 +743,9 @@ async def use_rat(message: Message):
         await message.reply("❌ У вас нет крысы.")
         return
 
-    cursor.execute("SELECT user_id, full_name, balance FROM users WHERE user_id != ?", (sender.id,))
-    targets = cursor.fetchall()
+    with db_lock:
+        cursor.execute("SELECT user_id, full_name, balance FROM users WHERE user_id != ?", (sender.id,))
+        targets = cursor.fetchall()
 
     if not targets:
         await message.reply("❌ Недостаточно игроков в группе.")
@@ -747,10 +760,10 @@ async def use_rat(message: Message):
         await message.reply(f"🐀 Крыса обыскала карманы {target_name}...\n\n😢 Но там не оказалось ни одной ладушки.")
     elif target_bal < wanted_steal:
         stolen = target_bal
-        cursor.execute("UPDATE users SET balance = 0 WHERE user_id=?", (target_id,))
-        cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (stolen, sender.id))
-        db.commit()
-        trigger_github_upload()
+        with db_lock:
+            cursor.execute("UPDATE users SET balance = 0 WHERE user_id=?", (target_id,))
+            cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (stolen, sender.id))
+            db.commit()
         add_history(target_id, sender.id, stolen, "rat_steal")
 
         await message.reply(
@@ -760,10 +773,10 @@ async def use_rat(message: Message):
         )
     else:
         stolen = wanted_steal
-        cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (stolen, target_id))
-        cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (stolen, sender.id))
-        db.commit()
-        trigger_github_upload()
+        with db_lock:
+            cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (stolen, target_id))
+            cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (stolen, sender.id))
+            db.commit()
         add_history(target_id, sender.id, stolen, "rat_steal")
 
         await message.reply(f"🐀 Крыса пробралась к {target_name}!\n\n💸 Украдено: {stolen} ладушки")
@@ -803,9 +816,10 @@ async def transfer_custom_amount(message: Message):
         await message.reply(f"❌ <b>Недостаточно средств!</b>\nУ вас на балансе: <b>{sender_balance}</b> ладушек.")
         return
 
-    cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (amount, sender.id))
-    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, receiver.id))
-    db.commit()
+    with db_lock:
+        cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (amount, sender.id))
+        cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, receiver.id))
+        db.commit()
 
     add_history(sender.id, receiver.id, amount, "transfer")
 
@@ -832,16 +846,13 @@ async def transfer_one_ladushka(message: Message):
 
     sender = message.from_user
 
-    # Обработка активной дуэли
     if active_duel and active_duel["status"] == "active":
         p1 = active_duel["challenger"]
         p2 = active_duel["opponent"]
 
-        # Если пишет игрок, не участвующий в дуэли — игнорируем полностью
         if sender.id not in [p1.id, p2.id]:
             return
 
-        # Если сейчас не ход этого игрока
         if sender.id != active_duel["current_turn"]:
             await message.reply("⏳ Сейчас не ваш ход.")
             return
@@ -853,7 +864,6 @@ async def transfer_one_ladushka(message: Message):
         attacker_mention = get_user_mention(attacker)
         defender_mention = get_user_mention(defender)
 
-        # 25% шанс нокаута/победного удара
         is_finish = random.random() < 0.25
 
         if is_finish:
@@ -862,10 +872,10 @@ async def transfer_one_ladushka(message: Message):
             stolen = min(def_bal, 3)
 
             if stolen > 0:
-                cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (stolen, defender.id))
-                cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (stolen, attacker.id))
-                db.commit()
-                trigger_github_upload()
+                with db_lock:
+                    cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (stolen, defender.id))
+                    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (stolen, attacker.id))
+                    db.commit()
                 add_history(defender.id, attacker.id, stolen, "duel_win")
 
             active_duel = None
@@ -888,7 +898,6 @@ async def transfer_one_ladushka(message: Message):
             await message.answer(text, disable_web_page_preview=True)
             return
 
-    # Обычная передача 1 ладушки вне дуэли
     if not message.reply_to_message or not message.reply_to_message.from_user:
         return
 
@@ -907,9 +916,10 @@ async def transfer_one_ladushka(message: Message):
         await message.reply("❌ У вас нет ладушек.")
         return
 
-    cursor.execute("UPDATE users SET balance = balance - 1 WHERE user_id=?", (sender.id,))
-    cursor.execute("UPDATE users SET balance = balance + 1 WHERE user_id=?", (receiver.id,))
-    db.commit()
+    with db_lock:
+        cursor.execute("UPDATE users SET balance = balance - 1 WHERE user_id=?", (sender.id,))
+        cursor.execute("UPDATE users SET balance = balance + 1 WHERE user_id=?", (receiver.id,))
+        db.commit()
 
     add_history(sender.id, receiver.id, 1, "transfer")
 
@@ -928,13 +938,14 @@ async def transfer_one_ladushka(message: Message):
 
 @dp.message(F.text.lower() == "топ богачей")
 async def top_players(message: Message):
-    cursor.execute("""
-        SELECT user_id, full_name, username, balance
-        FROM users
-        ORDER BY balance DESC
-        LIMIT 10
-    """)
-    rows = cursor.fetchall()
+    with db_lock:
+        cursor.execute("""
+            SELECT user_id, full_name, username, balance
+            FROM users
+            ORDER BY balance DESC
+            LIMIT 10
+        """)
+        rows = cursor.fetchall()
 
     if not rows:
         await message.answer("Пока нет участников.")
@@ -951,15 +962,16 @@ async def top_players(message: Message):
 
 @dp.message(Command("history"))
 async def history(message: Message):
-    cursor.execute("""
-        SELECT action, amount, date
-        FROM history
-        WHERE sender=? OR receiver=?
-        ORDER BY id DESC
-        LIMIT 10
-    """, (message.from_user.id, message.from_user.id))
+    with db_lock:
+        cursor.execute("""
+            SELECT action, amount, date
+            FROM history
+            WHERE sender=? OR receiver=?
+            ORDER BY id DESC
+            LIMIT 10
+        """, (message.from_user.id, message.from_user.id))
+        rows = cursor.fetchall()
 
-    rows = cursor.fetchall()
     if not rows:
         await message.answer("📜 История пуста.")
         return
@@ -996,8 +1008,9 @@ async def add_reputation(message: Message):
         return
 
     new_rep = current_rep + 1
-    cursor.execute("UPDATE users SET reputation=? WHERE user_id=?", (new_rep, target.id))
-    db.commit()
+    with db_lock:
+        cursor.execute("UPDATE users SET reputation=? WHERE user_id=?", (new_rep, target.id))
+        db.commit()
     trigger_github_upload()
 
     await message.reply(
@@ -1030,8 +1043,9 @@ async def remove_reputation(message: Message):
         return
 
     new_rep = current_rep - 1
-    cursor.execute("UPDATE users SET reputation=? WHERE user_id=?", (new_rep, target.id))
-    db.commit()
+    with db_lock:
+        cursor.execute("UPDATE users SET reputation=? WHERE user_id=?", (new_rep, target.id))
+        db.commit()
     trigger_github_upload()
 
     await message.reply(
@@ -1043,13 +1057,14 @@ async def remove_reputation(message: Message):
 
 @dp.message(F.text.lower() == "репутация")
 async def top_reputation_handler(message: Message):
-    cursor.execute("""
-        SELECT full_name, reputation
-        FROM users
-        ORDER BY reputation DESC
-        LIMIT 5
-    """)
-    rows = cursor.fetchall()
+    with db_lock:
+        cursor.execute("""
+            SELECT full_name, reputation
+            FROM users
+            ORDER BY reputation DESC
+            LIMIT 5
+        """)
+        rows = cursor.fetchall()
 
     if not rows:
         await message.answer("⭐ Топ по репутации пуст.")
@@ -1097,9 +1112,9 @@ async def fine_handler(message: Message):
 
     if current_bal < fine_amount:
         deducted = current_bal
-        cursor.execute("UPDATE users SET balance = 0 WHERE user_id=?", (target.id,))
-        db.commit()
-        trigger_github_upload()
+        with db_lock:
+            cursor.execute("UPDATE users SET balance = 0 WHERE user_id=?", (target.id,))
+            db.commit()
         add_history(ADMIN_ID, target.id, deducted, "fine")
 
         await message.reply(
@@ -1111,9 +1126,9 @@ async def fine_handler(message: Message):
         )
     else:
         new_bal = current_bal - fine_amount
-        cursor.execute("UPDATE users SET balance = ? WHERE user_id=?", (new_bal, target.id))
-        db.commit()
-        trigger_github_upload()
+        with db_lock:
+            cursor.execute("UPDATE users SET balance = ? WHERE user_id=?", (new_bal, target.id))
+            db.commit()
         add_history(ADMIN_ID, target.id, fine_amount, "fine")
 
         await message.reply(
@@ -1140,8 +1155,10 @@ async def add_balance(message: Message):
 
     user = message.reply_to_message.from_user
     register_user(user)
-    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user.id))
-    db.commit()
+
+    with db_lock:
+        cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user.id))
+        db.commit()
 
     add_history(ADMIN_ID, user.id, amount, "add")
     user_link = get_user_mention(user)
@@ -1161,8 +1178,9 @@ async def remove_balance(message: Message):
         return
 
     user = message.reply_to_message.from_user
-    cursor.execute("UPDATE users SET balance = MAX(balance-?,0) WHERE user_id=?", (amount, user.id))
-    db.commit()
+    with db_lock:
+        cursor.execute("UPDATE users SET balance = MAX(balance-?,0) WHERE user_id=?", (amount, user.id))
+        db.commit()
 
     add_history(ADMIN_ID, user.id, amount, "remove")
     await message.answer("✅ Ладушки сняты.")
@@ -1181,8 +1199,10 @@ async def set_balance(message: Message):
         return
 
     user = message.reply_to_message.from_user
-    cursor.execute("UPDATE users SET balance=? WHERE user_id=?", (amount, user.id))
-    db.commit()
+    register_user(user)
+    with db_lock:
+        cursor.execute("UPDATE users SET balance=? WHERE user_id=?", (amount, user.id))
+        db.commit()
     trigger_github_upload()
 
     await message.answer("✅ Баланс изменён.")
@@ -1201,10 +1221,12 @@ async def admin_bonus(message: Message):
         return
 
     user = message.reply_to_message.from_user
-    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user.id))
-    db.commit()
-    trigger_github_upload()
-
+    register_user(user)
+    with db_lock:
+        cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user.id))
+        db.commit()
+    
+    add_history(ADMIN_ID, user.id, amount, "admin_bonus")
     user_link = get_user_mention(user)
     await message.answer(f"🎁 Игрок {user_link} получил бонус {amount} ладушек.", disable_web_page_preview=True)
 
@@ -1214,8 +1236,9 @@ async def reset(message: Message):
     if not is_admin(message.from_user.id) or not message.reply_to_message or not message.reply_to_message.from_user:
         return
     user = message.reply_to_message.from_user
-    cursor.execute("UPDATE users SET balance=0 WHERE user_id=?", (user.id,))
-    db.commit()
+    with db_lock:
+        cursor.execute("UPDATE users SET balance=0 WHERE user_id=?", (user.id,))
+        db.commit()
     trigger_github_upload()
 
     await message.answer("♻️ Баланс игрока сброшен.")
@@ -1293,10 +1316,11 @@ async def daily_ladushki_task():
 async def cleanup_db_task():
     while True:
         try:
-            cursor.execute("DELETE FROM inventory WHERE quantity <= 0")
-            cutoff_date = (datetime.now() - timedelta(days=30)).strftime("%d.%m.%Y")
-            cursor.execute("DELETE FROM history WHERE date < ?", (cutoff_date,))
-            db.commit()
+            with db_lock:
+                cursor.execute("DELETE FROM inventory WHERE quantity <= 0")
+                cutoff_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+                cursor.execute("DELETE FROM history WHERE date < ?", (cutoff_date,))
+                db.commit()
             print("Очистка базы данных завершена.")
             trigger_github_upload()
         except Exception as e:
