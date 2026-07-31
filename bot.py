@@ -403,7 +403,7 @@ async def accept_duel_callback(callback: CallbackQuery):
     await callback.message.edit_text(
         f"⚔️ <b>Дуэль началась!</b>\n\n"
         f"🎯 Первым ходит: {first_mention}\n\n"
-        f"Чтобы ударить, напишите:\n<code>ладушка</code>",
+        f"Чтобы ударить, напишите:\n<code>подарок</code>",
         disable_web_page_preview=True
     )
     await callback.answer()
@@ -458,6 +458,7 @@ async def start(message: Message):
         "• Напишите <b>инвентарь</b> — чтобы посмотреть свои предметы.\n"
         "• Напишите <b>репутация</b> — чтобы увидеть ТОП-5 по репутации.\n"
         "• Напишите <b>крыса</b> — запустить крысу украсть ладушки у случайного игрока.\n"
+        "• Ответьте на сообщение текстом <b>подарок</b> — чтобы подарить 1 ладушку.\n"
         "• Ответьте на сообщение текстом <b>дать 50</b> — чтобы перевести ладушки.\n"
         "• Ответьте на сообщение текстом <b>ударить ладушкой</b> — применить Боевую ладушку.\n"
         "• Ответьте на сообщение текстом <b>кинуть томат</b> — бросить томат в участника."
@@ -840,7 +841,7 @@ async def transfer_custom_amount(message: Message):
     )
 
 
-@dp.message(F.text.lower() == "ладушка")
+@dp.message(F.text.lower() == "подарок")
 async def transfer_one_ladushka(message: Message):
     global active_duel
 
@@ -893,7 +894,7 @@ async def transfer_one_ladushka(message: Message):
             text = (
                 f"👏 {attacker_mention} ударил ладушкой {defender_mention}!\n\n"
                 f"🎯 Теперь ходит:\n{defender_mention}\n\n"
-                f"Напишите:\n<code>ладушка</code>"
+                f"Напишите:\n<code>подарок</code>"
             )
             await message.answer(text, disable_web_page_preview=True)
             return
@@ -904,7 +905,7 @@ async def transfer_one_ladushka(message: Message):
     receiver = message.reply_to_message.from_user
 
     if sender.id == receiver.id:
-        await message.reply("❌ Нельзя передавать ладушки самому себе.")
+        await message.reply("❌ Нельзя дарить ладушки самому себе.")
         return
 
     register_user(sender)
@@ -927,9 +928,10 @@ async def transfer_one_ladushka(message: Message):
     receiver_mention = get_user_mention(receiver)
 
     await message.reply(
-        f"🪙 <b>Ладушка передана!</b>\n\n"
+        f"🎁 <b>Подарок отправлен!</b>\n\n"
         f"От: {sender_mention}\n"
-        f"Кому: {receiver_mention}\n\n"
+        f"Кому: {receiver_mention}\n"
+        f"Передано: <b>1 ладушка</b> 🪙\n\n"
         f"Теперь у вас {get_balance(sender.id)} ладушек.\n"
         f"У {receiver_mention} {get_balance(receiver.id)} ладушек.",
         disable_web_page_preview=True
