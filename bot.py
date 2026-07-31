@@ -311,6 +311,7 @@ async def start(message: Message):
         "• Напишите <b>бонус</b> — чтобы получить ежедневный бонус.\n"
         "• Напишите <b>магазин</b> — чтобы открыть магазин предметов.\n"
         "• Напишите <b>инвентарь</b> — чтобы посмотреть свои предметы.\n"
+        "• Напишите <b>репутация</b> — чтобы увидеть ТОП-5 по репутации.\n"
         "• Напишите <b>крыса</b> — запустить крысу украсть ладушки у случайного игрока.\n"
         "• Ответьте на сообщение текстом <b>дать 50</b> — чтобы перевести ладушки.\n"
         "• Ответьте на сообщение текстом <b>ударить ладушкой</b> — применить Боевую ладушку.\n"
@@ -758,7 +759,7 @@ async def transfer_one_ladushka(message: Message):
     )
 
 
-@dp.message(Command("top"))
+@dp.message(Command("топ богачей"))
 async def top_players(message: Message):
     cursor.execute("""
         SELECT user_id, full_name, username, balance
@@ -772,7 +773,7 @@ async def top_players(message: Message):
         await message.answer("Пока нет участников.")
         return
 
-    text = "🏆 <b>ТОП Участников</b>\n\n"
+    text = "💰 <b>Топ богачей</b>\n\n"
     for i, row in enumerate(rows, start=1):
         uid, name, uname, bal = row
         url = f"https://t.me/{uname}" if uname else f"tg://user?id={uid}"
@@ -828,6 +829,7 @@ async def add_reputation(message: Message):
         return
 
     new_rep = current_rep + 1
+    # Обновление существующей записи игрока в базе
     cursor.execute("UPDATE users SET reputation=? WHERE user_id=?", (new_rep, target.id))
     db.commit()
     trigger_github_upload()
@@ -862,6 +864,7 @@ async def remove_reputation(message: Message):
         return
 
     new_rep = current_rep - 1
+    # Обновление существующей записи игрока в базе
     cursor.execute("UPDATE users SET reputation=? WHERE user_id=?", (new_rep, target.id))
     db.commit()
     trigger_github_upload()
@@ -871,6 +874,31 @@ async def remove_reputation(message: Message):
         f"👤 <b>Игрок:</b> {target.full_name}\n"
         f"➖ <b>Репутация:</b> -1"
     )
+
+
+# Команда "репутация" — ТОП-5 по репутации
+@dp.message(F.text.lower() == "репутация")
+async def top_reputation_handler(message: Message):
+    cursor.execute("""
+        SELECT full_name, reputation
+        FROM users
+        ORDER BY reputation DESC
+        LIMIT 5
+    """)
+    rows = cursor.fetchall()
+
+    if not rows:
+        await message.answer("⭐ Топ по репутации пуст.")
+        return
+
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+    text = "⭐ <b>Топ по репутации</b>\n\n"
+
+    for idx, (full_name, rep) in enumerate(rows):
+        emoji = medals[idx] if idx < len(medals) else f"{idx + 1}️⃣"
+        text += f"{emoji} {full_name} — {rep} репутации\n"
+
+    await message.answer(text)
 
 
 # --- АДМИНСКИЕ КОМАНДЫ И НОВАЯ СИСТЕМА ШТРАФОВ ---
