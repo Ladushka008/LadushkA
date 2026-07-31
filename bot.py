@@ -47,10 +47,11 @@ active_duel = None
 
 
 # ==========================
-# GITHUB СИНХРОНИЗАЦИЯ
+# GITHUB СИНХРОНИЗАЦИЯ (ЖЕЛЕЗНАЯ ЛОГИКА)
 # ==========================
 
 def _sync_download():
+    """Скачивает базу данных из GitHub при старте бота"""
     if not GITHUB_TOKEN or not GITHUB_REPO:
         print("GitHub sync failed: missing token or repo")
         return False
@@ -62,31 +63,30 @@ def _sync_download():
     }
 
     try:
-        response = requests.get(url, headers=headers, params={"ref": BRANCH}, timeout=10)
+        response = requests.get(url, headers=headers, params={"ref": BRANCH}, timeout=15)
         if response.status_code == 200:
             content_b64 = response.json().get("content", "")
             file_data = base64.b64decode(content_b64)
             with db_lock:
                 with open(DB_FILE, "wb") as f:
                     f.write(file_data)
-            print("Database downloaded from GitHub")
+            print("🟢 Database successfully downloaded from GitHub!")
             return True
         else:
-            print(f"GitHub sync download failed: {response.status_code}")
+            print(f"🔴 GitHub sync download failed: status {response.status_code}")
             return False
     except Exception as e:
-        print(f"GitHub sync download error: {e}")
+        print(f"🔴 GitHub sync download error: {e}")
         return False
 
 
 def _sync_upload():
+    """Загружает базу данных в GitHub с обработкой SHA-хэша"""
     if not GITHUB_TOKEN or not GITHUB_REPO:
-        print("GitHub sync failed: missing token or repo")
         return False
 
     with db_lock:
         if not os.path.exists(DB_FILE):
-            print("GitHub sync upload failed: DB file not found")
             return False
         with open(DB_FILE, "rb") as f:
             content_bytes = f.read()
@@ -100,43 +100,45 @@ def _sync_upload():
     try:
         content_b64 = base64.b64encode(content_bytes).decode("utf-8")
 
+        # Получаем актуальный SHA перед записью, чтобы избегать 409 Conflict
         sha = None
         get_resp = requests.get(url, headers=headers, params={"ref": BRANCH}, timeout=10)
         if get_resp.status_code == 200:
             sha = get_resp.json().get("sha")
 
         data = {
-            "message": "Auto-update database.db",
+            "message": "Auto-update database.db [Instant Save]",
             "content": content_b64,
             "branch": BRANCH
         }
         if sha:
             data["sha"] = sha
 
-        put_resp = requests.put(url, headers=headers, json=data, timeout=10)
+        put_resp = requests.put(url, headers=headers, json=data, timeout=15)
         if put_resp.status_code in [200, 201]:
-            print("Database uploaded to GitHub successfully")
+            print("🟢 Database uploaded to GitHub successfully!")
             return True
         else:
-            print(f"GitHub sync upload failed: {put_resp.status_code} - {put_resp.text}")
+            print(f"🔴 GitHub sync upload failed: {put_resp.status_code} - {put_resp.text}")
             return False
     except Exception as e:
-        print(f"GitHub sync upload error: {e}")
+        print(f"🔴 GitHub sync upload error: {e}")
         return False
 
 
-def trigger_github_upload():
+def save_db_changes():
+    """Принудительное сохранение измененного файла в GitHub"""
     asyncio.create_task(asyncio.to_thread(_sync_upload))
 
 
 # ==========================
-# БАЗА ДАННЫХ
+# ИНИЦИАЛИЗАЦИЯ И РАБОТА С БД
 # ==========================
 
 def init_db():
     global db, cursor
-    if not os.path.exists(DB_FILE):
-        _sync_download()
+    # Скачиваем последнюю копию из GitHub
+    _sync_download()
 
     db = sqlite3.connect(DB_FILE, check_same_thread=False)
     cursor = db.cursor()
@@ -264,7 +266,7 @@ def add_history(sender, receiver, amount, action, reason=""):
             )
         )
         db.commit()
-    trigger_github_upload()
+    save_db_changes()
 
 
 def is_admin(user_id: int):
@@ -286,7 +288,7 @@ def add_item(user_id, item_name, count=1):
             ON CONFLICT(user_id, item_name) DO UPDATE SET quantity = quantity + ?
         """, (user_id, item_name, count, count))
         db.commit()
-    trigger_github_upload()
+    save_db_changes()
 
 
 def remove_item(user_id, item_name, count=1):
@@ -297,7 +299,7 @@ def remove_item(user_id, item_name, count=1):
         else:
             cursor.execute("UPDATE inventory SET quantity = quantity - ? WHERE user_id=? AND item_name=?", (count, user_id, item_name))
         db.commit()
-    trigger_github_upload()
+    save_db_changes()
 
 
 # ==========================
@@ -309,7 +311,7 @@ async def duel_timeout_task(chat_id: int):
     global active_duel
     if active_duel:
         active_duel = None
-        await bot.send_message(chat_id, "⌛ Дуэль отменена из-за отсутствия активности.")
+        await bot.send_message(chat_id, "⌛ Дуэль отменена из-за отсутствия активности (10 минут).")
 
 
 def cancel_duel_timer():
@@ -330,7 +332,7 @@ async def start_duel_request(message: Message):
     global active_duel
 
     if active_duel is not None:
-        await message.reply("⚔️ Сейчас уже идёт дуэль. Дождитесь её окончания.")
+        await message.reply("⚔️ Сейчас уже идёт дуэль. Дождитесь её окончания или отмените командой `отмена дуэли`.")
         return
 
     if not message.reply_to_message or not message.reply_to_message.from_user:
@@ -376,6 +378,21 @@ async def start_duel_request(message: Message):
         reply_markup=keyboard,
         disable_web_page_preview=True
     )
+
+
+@dp.message(F.text.lower().in_(["отмена дуэли", "стоп дуэль", "отмена"]))
+async def cancel_duel_command(message: Message):
+    global active_duel
+    if not active_duel:
+        return
+
+    user_id = message.from_user.id
+    if user_id in [active_duel["challenger"].id, active_duel["opponent"].id] or is_admin(user_id):
+        cancel_duel_timer()
+        active_duel = None
+        await message.reply("🛑 Дуэль была успешно отменена.")
+    else:
+        await message.reply("❌ Вы не участвуете в текущей дуэли.")
 
 
 @dp.callback_query(F.data.startswith("duel_accept_"))
@@ -512,6 +529,7 @@ async def start(message: Message):
         "• Напишите <b>баланс</b> — чтобы узнать счет.\n"
         "• Напишите <b>бонус</b> — чтобы получить ежедневный бонус.\n"
         "• Напишите <b>дуэль</b> — вызвать игрока на дуэль (ответом на сообщение).\n"
+        "• Напишите <b>отмена</b> — отменить дуэль.\n"
         "• Напишите <b>магазин</b> — чтобы открыть магазин предметов.\n"
         "• Напишите <b>инвентарь</b> — чтобы посмотреть свои предметы.\n"
         "• Напишите <b>репутация</b> — чтобы увидеть ТОП-5 по репутации.\n"
@@ -1022,7 +1040,7 @@ async def add_reputation(message: Message):
     with db_lock:
         cursor.execute("UPDATE users SET reputation=? WHERE user_id=?", (new_rep, target.id))
         db.commit()
-    trigger_github_upload()
+    save_db_changes()
 
     await message.reply(
         f"⭐ <b>Репутация выдана!</b>\n\n"
@@ -1057,7 +1075,7 @@ async def remove_reputation(message: Message):
     with db_lock:
         cursor.execute("UPDATE users SET reputation=? WHERE user_id=?", (new_rep, target.id))
         db.commit()
-    trigger_github_upload()
+    save_db_changes()
 
     await message.reply(
         f"⭐ <b>Репутация изменена!</b>\n\n"
@@ -1138,7 +1156,7 @@ async def fine_handler(message: Message):
     else:
         new_bal = current_bal - fine_amount
         with db_lock:
-            cursor.execute("UPDATE users SET balance = ? WHERE user_id=?", (target.id,), (new_bal,))
+            cursor.execute("UPDATE users SET balance = ? WHERE user_id=?", (new_bal, target.id))
             db.commit()
         add_history(ADMIN_ID, target.id, fine_amount, "fine")
 
@@ -1214,7 +1232,7 @@ async def set_balance(message: Message):
     with db_lock:
         cursor.execute("UPDATE users SET balance=? WHERE user_id=?", (amount, user.id))
         db.commit()
-    trigger_github_upload()
+    save_db_changes()
 
     await message.answer("✅ Баланс изменён.")
 
@@ -1250,7 +1268,7 @@ async def reset(message: Message):
     with db_lock:
         cursor.execute("UPDATE users SET balance=0 WHERE user_id=?", (user.id,))
         db.commit()
-    trigger_github_upload()
+    save_db_changes()
 
     await message.answer("♻️ Баланс игрока сброшен.")
 
@@ -1328,12 +1346,14 @@ async def cleanup_db_task():
     while True:
         try:
             with db_lock:
+                # Очищаем недействительный инвентарь
                 cursor.execute("DELETE FROM inventory WHERE quantity <= 0")
-                cutoff_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+                # Очищаем историю старше 14 дней для уменьшения размера БД
+                cutoff_date = (datetime.now() - timedelta(days=14)).strftime("%Y-%m-%d %H:%M:%S")
                 cursor.execute("DELETE FROM history WHERE date < ?", (cutoff_date,))
                 db.commit()
-            print("Очистка базы данных завершена.")
-            trigger_github_upload()
+            print("🧹 Очистка базы данных завершена.")
+            save_db_changes()
         except Exception as e:
             print(f"Ошибка при автоматической очистке БД: {e}")
 
@@ -1347,7 +1367,7 @@ async def main():
     asyncio.create_task(cleanup_db_task())
     
     await bot.delete_webhook(drop_pending_updates=True)
-    print("Бот успешно запущен и ожидает сообщений!")
+    print("🚀 Бот успешно запущен и готове к работе!")
     await dp.start_polling(bot)
 
 
