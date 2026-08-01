@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import Message
 from aiogram.client.default import DefaultBotProperties
 from aiohttp import web
 
@@ -41,9 +41,6 @@ dp = Dispatcher()
 db = None
 cursor = None
 db_lock = threading.Lock()
-
-# Глобальное состояние дуэли
-active_duel = None
 
 
 # ==========================
@@ -302,218 +299,6 @@ def remove_item(user_id, item_name, count=1):
 
 
 # ==========================
-# СИСТЕМА ДУЭЛЕЙ
-# ==========================
-
-async def duel_timeout_task(chat_id: int):
-    await asyncio.sleep(600)
-    global active_duel
-    if active_duel:
-        active_duel = None
-        await bot.send_message(chat_id, "⌛ Дуэль отменена из-за отсутствия активности (10 минут).")
-
-
-def cancel_duel_timer():
-    global active_duel
-    if active_duel and active_duel.get("timer_task"):
-        active_duel["timer_task"].cancel()
-
-
-def reset_duel_timer(chat_id: int):
-    global active_duel
-    cancel_duel_timer()
-    if active_duel:
-        active_duel["timer_task"] = asyncio.create_task(duel_timeout_task(chat_id))
-
-
-@dp.message(F.text.lower() == "дуэль")
-async def start_duel_request(message: Message):
-    global active_duel
-
-    if active_duel is not None:
-        await message.reply("⚔️ Сейчас уже идёт дуэль. Дождитесь её окончания или отмените командой <code>отмена дуэли</code>.")
-        return
-
-    if not message.reply_to_message or not message.reply_to_message.from_user:
-        await message.reply("⚠️ Эта команда должна быть ответом на сообщение пользователя!")
-        return
-
-    challenger = message.from_user
-    opponent = message.reply_to_message.from_user
-
-    if opponent.is_bot:
-        await message.reply("🤖 Бота нельзя вызвать на дуэль.")
-        return
-
-    if challenger.id == opponent.id:
-        await message.reply("❌ Нельзя вызвать самого себя на дуэль.")
-        return
-
-    register_user(challenger)
-    register_user(opponent)
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Принять", callback_data=f"duel_accept_{challenger.id}_{opponent.id}"),
-                InlineKeyboardButton(text="❌ Отказаться", callback_data=f"duel_decline_{challenger.id}_{opponent.id}")
-            ]
-        ]
-    )
-
-    active_duel = {
-        "status": "pending",
-        "challenger": challenger,
-        "opponent": opponent,
-        "current_turn": None,
-        "timer_task": asyncio.create_task(duel_timeout_task(message.chat.id))
-    }
-
-    challenger_link = get_user_mention(challenger)
-    opponent_link = get_user_mention(opponent)
-
-    await message.answer(
-        f"⚔️ {challenger_link} вызывает {opponent_link} на дуэль!",
-        reply_markup=keyboard,
-        disable_web_page_preview=True
-    )
-
-
-@dp.message(F.text.lower().in_(["отмена дуэли", "стоп дуэль", "отмена"]))
-async def cancel_duel_command(message: Message):
-    global active_duel
-    if not active_duel:
-        return
-
-    user_id = message.from_user.id
-    if user_id in [active_duel["challenger"].id, active_duel["opponent"].id] or is_admin(user_id):
-        cancel_duel_timer()
-        active_duel = None
-        await message.reply("🛑 Дуэль была успешно отменена.")
-    else:
-        await message.reply("❌ Вы не участвуете в текущей дуэли.")
-
-
-@dp.callback_query(F.data.startswith("duel_accept_"))
-async def accept_duel_callback(callback: CallbackQuery):
-    global active_duel
-
-    if not active_duel or active_duel["status"] != "pending":
-        await callback.answer("Дуэль больше недоступна.", show_alert=True)
-        return
-
-    parts = callback.data.split("_")
-    opponent_id = int(parts[3])
-
-    if callback.from_user.id != opponent_id:
-        await callback.answer("Эта кнопка не для вас!", show_alert=True)
-        return
-
-    first, second = random.sample([active_duel["challenger"], active_duel["opponent"]], 2)
-    active_duel["status"] = "active"
-    active_duel["current_turn"] = first.id
-    reset_duel_timer(callback.message.chat.id)
-
-    first_mention = get_user_mention(first)
-
-    await callback.message.edit_text(
-        f"⚔️ <b>Дуэль началась!</b>\n\n"
-        f"🎯 Первым ходит: {first_mention}\n\n"
-        f"Чтобы ударить, напишите:\n<code>удар</code>",
-        disable_web_page_preview=True
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("duel_decline_"))
-async def decline_duel_callback(callback: CallbackQuery):
-    global active_duel
-
-    if not active_duel or active_duel["status"] != "pending":
-        await callback.answer("Дуэль больше недоступна.", show_alert=True)
-        return
-
-    parts = callback.data.split("_")
-    opponent_id = int(parts[3])
-
-    if callback.from_user.id != opponent_id:
-        await callback.answer("Эта кнопка не для вас!", show_alert=True)
-        return
-
-    cancel_duel_timer()
-    opponent_mention = get_user_mention(active_duel["opponent"])
-    active_duel = None
-
-    await callback.message.edit_text(
-        f"❌ {opponent_mention} отказался от дуэли.",
-        disable_web_page_preview=True
-    )
-    await callback.answer()
-
-
-@dp.message(F.text.lower().in_(["удар", "ударить"]))
-async def make_duel_hit(message: Message):
-    global active_duel
-
-    if not active_duel or active_duel["status"] != "active":
-        return
-
-    sender = message.from_user
-    p1 = active_duel["challenger"]
-    p2 = active_duel["opponent"]
-
-    if sender.id not in [p1.id, p2.id]:
-        return
-
-    if sender.id != active_duel["current_turn"]:
-        await message.reply("⏳ Сейчас не ваш ход.")
-        return
-
-    reset_duel_timer(message.chat.id)
-    
-    # Определяем кто атакует и кто защищается
-    attacker = sender
-    defender = p2 if sender.id == p1.id else p1
-
-    attacker_mention = get_user_mention(attacker)
-    defender_mention = get_user_mention(defender)
-
-    # Вероятность 30% нокаута
-    is_finish = random.random() < 0.30
-
-    if is_finish:
-        cancel_duel_timer()
-        def_bal = get_balance(defender.id)
-        stolen = min(def_bal, 3)
-
-        if stolen > 0:
-            with db_lock:
-                cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (stolen, defender.id))
-                cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (stolen, attacker.id))
-                db.commit()
-            add_history(defender.id, attacker.id, stolen, "duel_win")
-
-        active_duel = None
-
-        text = (
-            f"💥 {attacker_mention} мощно врезал ладушкой по {defender_mention}!\n\n"
-            f"🏆 <b>Победитель:</b> {attacker_mention}\n\n"
-            f"💰 {attacker_mention} получает {stolen} ладушки.\n"
-            f"💸 {defender_mention} теряет {stolen} ладушки."
-        )
-        await message.answer(text, disable_web_page_preview=True)
-    else:
-        # Передаем ход сопернику
-        active_duel["current_turn"] = defender.id
-        text = (
-            f"👏 {attacker_mention} ударил ладушкой {defender_mention}!\n\n"
-            f"🎯 Теперь ходит:\n{defender_mention}\n\n"
-            f"Напишите:\n<code>удар</code>"
-        )
-        await message.answer(text, disable_web_page_preview=True)
-
-
-# ==========================
 # ОСНОВНЫЕ ХЕНДЛЕРЫ
 # ==========================
 
@@ -531,8 +316,6 @@ async def start(message: Message):
         "• Напишите <b>профиль</b> — чтобы посмотреть свой профиль.\n"
         "• Напишите <b>баланс</b> — чтобы узнать счет.\n"
         "• Напишите <b>бонус</b> — чтобы получить ежедневный бонус.\n"
-        "• Напишите <b>дуэль</b> — вызвать игрока на дуэль (ответом на сообщение).\n"
-        "• Напишите <b>отмена</b> — отменить дуэль.\n"
         "• Напишите <b>магазин</b> — чтобы открыть магазин предметов.\n"
         "• Напишите <b>инвентарь</b> — чтобы посмотреть свои предметы.\n"
         "• Напишите <b>репутация</b> — чтобы увидеть ТОП-5 по репутации.\n"
