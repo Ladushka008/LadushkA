@@ -149,7 +149,6 @@ def create_backup():
     with db_lock:
         if db:
             try:
-                # Используем встроенный механизм бэкапа SQLite для изоляции
                 bck = sqlite3.connect(backup_file)
                 db.backup(bck)
                 bck.close()
@@ -158,7 +157,6 @@ def create_backup():
                 print(f"🔴 Ошибка при создании бэкапа SQLite: {e}")
                 return
 
-    # Ротация резервных копий (оставляем только последние 20)
     backups = sorted(glob.glob(os.path.join(BACKUP_DIR, "backup_*.db")), key=os.path.getmtime)
     while len(backups) > MAX_BACKUPS:
         oldest = backups.pop(0)
@@ -214,10 +212,7 @@ def check_and_restore_db():
 
 async def init_db():
     global db, cursor
-    # Скачиваем последнюю копию из GitHub
     await asyncio.to_thread(_sync_download)
-    
-    # Проверяем целостность скачанной/локальной БД
     await asyncio.to_thread(check_and_restore_db)
 
     db = sqlite3.connect(DB_FILE, check_same_thread=False)
@@ -1262,6 +1257,47 @@ async def top_reputation_handler(message: Message):
 
 
 # --- АДМИНСКИЕ КОМАНДЫ И ШТРАФЫ ---
+
+@dp.message(F.text.lower() == "база")
+async def show_users_database(message: Message):
+    # Доступ только администраторам
+    if not is_admin(message.from_user.id):
+        await message.reply("⛔ Команда доступна только администраторам.")
+        return
+
+    with db_lock:
+        # Считаем общее число пользователей
+        cursor.execute("SELECT COUNT(*) FROM users")
+        total_users = cursor.fetchone()[0]
+
+        # Только читаем записи через SELECT без каких-либо изменений
+        cursor.execute("""
+            SELECT full_name, user_id, balance, reputation
+            FROM users
+            LIMIT 20
+        """)
+        rows = cursor.fetchall()
+
+    if not rows:
+        await message.reply("📂 База данных пользователей пуста.")
+        return
+
+    text = f"📊 <b>База пользователей (показано {len(rows)} из {total_users}):</b>\n\n"
+
+    for idx, (full_name, user_id, balance, reputation) in enumerate(rows, start=1):
+        text += (
+            f"👤 <b>Имя:</b> {full_name}\n"
+            f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
+            f"💰 <b>Баланс:</b> {balance} ладушек\n"
+            f"⭐ <b>Репутация:</b> {reputation}\n"
+            "───────────────\n"
+        )
+
+    if total_users > 20:
+        text += f"\nℹ️ <i>Всего пользователей в базе: {total_users}</i>"
+
+    await message.answer(text)
+
 
 @dp.message(F.text.lower().startswith("штраф"))
 async def fine_handler(message: Message):
