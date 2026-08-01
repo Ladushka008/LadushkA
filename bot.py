@@ -1355,18 +1355,22 @@ async def show_users_database(message: Message):
         cursor.execute("SELECT COUNT(*) FROM users")
         total_users = cursor.fetchone()[0]
 
+        cursor.execute("SELECT COUNT(*) FROM users WHERE balance > 0")
+        active_users = cursor.fetchone()[0]
+
         cursor.execute("""
             SELECT full_name, user_id, balance, reputation
             FROM users
-            LIMIT 20
+            WHERE balance > 0
+            ORDER BY balance DESC
         """)
         rows = cursor.fetchall()
 
     if not rows:
-        await message.reply("📂 База данных пользователей пуста.")
+        await message.reply("📂 База данных пользователей пуста (нет участников с балансом больше 0).")
         return
 
-    text = f"📊 <b>База пользователей (показано {len(rows)} из {total_users}):</b>\n\n"
+    text = f"📊 <b>База пользователей (показано {active_users} из {total_users}):</b>\n\n"
 
     for idx, (full_name, user_id, balance, reputation) in enumerate(rows, start=1):
         text += (
@@ -1376,9 +1380,6 @@ async def show_users_database(message: Message):
             f"⭐ <b>Репутация:</b> {reputation}\n"
             "───────────────\n"
         )
-
-    if total_users > 20:
-        text += f"\nℹ️ <i>Всего пользователей в базе: {total_users}</i>"
 
     await message.answer(text)
 
