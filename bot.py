@@ -1,4 +1,6 @@
 import os
+import glob
+import shutil
 import base64
 import asyncio
 import sqlite3
@@ -12,7 +14,7 @@ from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.client.default import DefaultBotProperties
 from aiohttp import web
 
@@ -29,6 +31,8 @@ GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID", "@ladushka09")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPO = os.getenv("GITHUB_REPO")
 DB_FILE = "database.db"
+BACKUP_DIR = "backups"
+MAX_BACKUPS = 20
 GITHUB_FILE_PATH = "database.db"
 BRANCH = "main"
 
@@ -41,6 +45,9 @@ dp = Dispatcher()
 db = None
 cursor = None
 db_lock = threading.Lock()
+
+# Глобальное состояние дуэли
+active_duel = None
 
 
 # ==========================
@@ -97,7 +104,6 @@ def _sync_upload():
     try:
         content_b64 = base64.b64encode(content_bytes).decode("utf-8")
 
-        # Всегда запрашиваем свежий SHA для предотвращения ошибок 409 Conflict
         sha = None
         get_resp = requests.get(url, headers=headers, params={"ref": BRANCH}, timeout=10)
         if get_resp.status_code == 200:
@@ -129,65 +135,146 @@ def save_db_changes():
 
 
 # ==========================
+# БЕКАПЫ И ПРОВЕРКА ЦЕЛОСТНОСТИ
+# ==========================
+
+def create_backup():
+    """Создаёт резервную копию базы данных и удаляет старые (>20)"""
+    if not os.path.exists(BACKUP_DIR):
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_file = os.path.join(BACKUP_DIR, f"backup_{timestamp}.db")
+
+    with db_lock:
+        if db:
+            try:
+                # Используем встроенный механизм бэкапа SQLite для изоляции
+                bck = sqlite3.connect(backup_file)
+                db.backup(bck)
+                bck.close()
+                print(f"🟢 Резервная копия создана: {backup_file}")
+            except Exception as e:
+                print(f"🔴 Ошибка при создании бэкапа SQLite: {e}")
+                return
+
+    # Ротация резервных копий (оставляем только последние 20)
+    backups = sorted(glob.glob(os.path.join(BACKUP_DIR, "backup_*.db")), key=os.path.getmtime)
+    while len(backups) > MAX_BACKUPS:
+        oldest = backups.pop(0)
+        try:
+            os.remove(oldest)
+            print(f"🧹 Удалена старая резервная копия: {oldest}")
+        except Exception as e:
+            print(f"🔴 Ошибка при удалении бэкапа {oldest}: {e}")
+
+
+def check_and_restore_db():
+    """Проверяет целостность БД. Если повреждена — восстанавливает из бэкапа."""
+    if not os.path.exists(DB_FILE):
+        print("ℹ️ Файл базы данных не найден. Будет создана новая БД.")
+        return
+
+    is_corrupt = False
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        res = conn.execute("PRAGMA quick_check;").fetchone()
+        conn.close()
+        if not res or res[0] != "ok":
+            is_corrupt = True
+    except Exception as e:
+        print(f"🔴 Ошибка чтения БД: {e}")
+        is_corrupt = True
+
+    if is_corrupt:
+        print("⚠️ Обнаружено повреждение базы данных! Запуск автовосстановления...")
+        backups = sorted(glob.glob(os.path.join(BACKUP_DIR, "backup_*.db")), key=os.path.getmtime, reverse=True)
+        restored = False
+        for bck in backups:
+            try:
+                test_conn = sqlite3.connect(bck)
+                res = test_conn.execute("PRAGMA quick_check;").fetchone()
+                test_conn.close()
+                if res and res[0] == "ok":
+                    shutil.copy(bck, DB_FILE)
+                    print(f"🟢 База данных успешно восстановлена из бэкапа: {bck}")
+                    restored = True
+                    break
+            except Exception:
+                continue
+        if not restored:
+            print("🔴 Не удалось найти исправный бэкап. Создаётся чистая база данных.")
+            if os.path.exists(DB_FILE):
+                os.remove(DB_FILE)
+
+
+# ==========================
 # ИНИЦИАЛИЗАЦИЯ И РАБОТА С БД
 # ==========================
 
 async def init_db():
     global db, cursor
-    # Скачиваем последнюю копию из GitHub в фоновом потоке
+    # Скачиваем последнюю копию из GitHub
     await asyncio.to_thread(_sync_download)
+    
+    # Проверяем целостность скачанной/локальной БД
+    await asyncio.to_thread(check_and_restore_db)
 
     db = sqlite3.connect(DB_FILE, check_same_thread=False)
     cursor = db.cursor()
 
     with db_lock:
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users(
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            full_name TEXT,
-            balance INTEGER DEFAULT 0,
-            last_bonus TEXT,
-            created_at TEXT,
-            reputation INTEGER DEFAULT 0
-        )
-        """)
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users(
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                balance INTEGER DEFAULT 0,
+                last_bonus TEXT,
+                created_at TEXT,
+                reputation INTEGER DEFAULT 0
+            )
+            """)
 
-        cursor.execute("PRAGMA table_info(users)")
-        columns = [column[1] for column in cursor.fetchall()]
-        if "last_bonus" not in columns:
-            cursor.execute("ALTER TABLE users ADD COLUMN last_bonus TEXT")
-        if "created_at" not in columns:
-            cursor.execute("ALTER TABLE users ADD COLUMN created_at TEXT")
-        if "reputation" not in columns:
-            cursor.execute("ALTER TABLE users ADD COLUMN reputation INTEGER DEFAULT 0")
+            cursor.execute("PRAGMA table_info(users)")
+            columns = [column[1] for column in cursor.fetchall()]
+            if "last_bonus" not in columns:
+                cursor.execute("ALTER TABLE users ADD COLUMN last_bonus TEXT")
+            if "created_at" not in columns:
+                cursor.execute("ALTER TABLE users ADD COLUMN created_at TEXT")
+            if "reputation" not in columns:
+                cursor.execute("ALTER TABLE users ADD COLUMN reputation INTEGER DEFAULT 0")
 
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS history(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sender INTEGER,
-            receiver INTEGER,
-            amount INTEGER,
-            action TEXT,
-            reason TEXT,
-            date TEXT
-        )
-        """)
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS history(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender INTEGER,
+                receiver INTEGER,
+                amount INTEGER,
+                action TEXT,
+                reason TEXT,
+                date TEXT
+            )
+            """)
 
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS inventory(
-            user_id INTEGER,
-            item_name TEXT,
-            quantity INTEGER DEFAULT 0,
-            PRIMARY KEY (user_id, item_name)
-        )
-        """)
-        db.commit()
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS inventory(
+                user_id INTEGER,
+                item_name TEXT,
+                quantity INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, item_name)
+            )
+            """)
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"🔴 Ошибка при инициализации таблиц: {e}")
 
 
 # ==========================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (ТРАНЗАКЦИОННЫЕ)
 # ==========================
 
 def register_user(user):
@@ -195,22 +282,27 @@ def register_user(user):
         return
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with db_lock:
-        cursor.execute(
-            """
-            INSERT OR IGNORE INTO users(user_id, username, full_name, balance, last_bonus, created_at, reputation)
-            VALUES(?,?,?,0,NULL,?,0)
-            """,
-            (user.id, user.username, user.full_name, now_str)
-        )
-        cursor.execute(
-            """
-            UPDATE users
-            SET username=?, full_name=?
-            WHERE user_id=?
-            """,
-            (user.username, user.full_name, user.id)
-        )
-        db.commit()
+        try:
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO users(user_id, username, full_name, balance, last_bonus, created_at, reputation)
+                VALUES(?,?,?,0,NULL,?,0)
+                """,
+                (user.id, user.username, user.full_name, now_str)
+            )
+            cursor.execute(
+                """
+                UPDATE users
+                SET username=?, full_name=?
+                WHERE user_id=?
+                """,
+                (user.username, user.full_name, user.id)
+            )
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"Ошибка регистрации пользователя: {e}")
+            return
     save_db_changes()
 
 
@@ -247,21 +339,26 @@ def get_total_items_count(user_id):
 
 def add_history(sender, receiver, amount, action, reason=""):
     with db_lock:
-        cursor.execute(
-            """
-            INSERT INTO history(sender, receiver, amount, action, reason, date)
-            VALUES(?,?,?,?,?,?)
-            """,
-            (
-                sender,
-                receiver,
-                amount,
-                action,
-                reason,
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            cursor.execute(
+                """
+                INSERT INTO history(sender, receiver, amount, action, reason, date)
+                VALUES(?,?,?,?,?,?)
+                """,
+                (
+                    sender,
+                    receiver,
+                    amount,
+                    action,
+                    reason,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                )
             )
-        )
-        db.commit()
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"Ошибка логирования истории: {e}")
+            return
     save_db_changes()
 
 
@@ -278,24 +375,247 @@ def get_item_quantity(user_id, item_name):
 
 def add_item(user_id, item_name, count=1):
     with db_lock:
-        cursor.execute("""
-            INSERT INTO inventory (user_id, item_name, quantity)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id, item_name) DO UPDATE SET quantity = quantity + ?
-        """, (user_id, item_name, count, count))
-        db.commit()
+        try:
+            cursor.execute("""
+                INSERT INTO inventory (user_id, item_name, quantity)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id, item_name) DO UPDATE SET quantity = quantity + ?
+            """, (user_id, item_name, count, count))
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"Ошибка добавления предмета: {e}")
+            return
     save_db_changes()
 
 
 def remove_item(user_id, item_name, count=1):
     current = get_item_quantity(user_id, item_name)
     with db_lock:
-        if current <= count:
-            cursor.execute("DELETE FROM inventory WHERE user_id=? AND item_name=?", (user_id, item_name))
-        else:
-            cursor.execute("UPDATE inventory SET quantity = quantity - ? WHERE user_id=? AND item_name=?", (count, user_id, item_name))
-        db.commit()
+        try:
+            if current <= count:
+                cursor.execute("DELETE FROM inventory WHERE user_id=? AND item_name=?", (user_id, item_name))
+            else:
+                cursor.execute("UPDATE inventory SET quantity = quantity - ? WHERE user_id=? AND item_name=?", (count, user_id, item_name))
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"Ошибка удаления предмета: {e}")
+            return
     save_db_changes()
+
+
+# ==========================
+# СИСТЕМА ДУЭЛЕЙ
+# ==========================
+
+async def duel_timeout_task(chat_id: int):
+    await asyncio.sleep(600)
+    global active_duel
+    if active_duel:
+        active_duel = None
+        await bot.send_message(chat_id, "⌛ Дуэль отменена из-за отсутствия активности (10 минут).")
+
+
+def cancel_duel_timer():
+    global active_duel
+    if active_duel and active_duel.get("timer_task"):
+        active_duel["timer_task"].cancel()
+
+
+def reset_duel_timer(chat_id: int):
+    global active_duel
+    cancel_duel_timer()
+    if active_duel:
+        active_duel["timer_task"] = asyncio.create_task(duel_timeout_task(chat_id))
+
+
+@dp.message(F.text.lower() == "дуэль")
+async def start_duel_request(message: Message):
+    global active_duel
+
+    if active_duel is not None:
+        await message.reply("⚔️ Сейчас уже идёт дуэль. Дождитесь её окончания или отмените командой <code>отмена дуэли</code>.")
+        return
+
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.reply("⚠️ Эта команда должна быть ответом на сообщение пользователя!")
+        return
+
+    challenger = message.from_user
+    opponent = message.reply_to_message.from_user
+
+    if opponent.is_bot:
+        await message.reply("🤖 Бота нельзя вызвать на дуэль.")
+        return
+
+    if challenger.id == opponent.id:
+        await message.reply("❌ Нельзя вызвать самого себя на дуэль.")
+        return
+
+    register_user(challenger)
+    register_user(opponent)
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Принять", callback_data=f"duel_accept_{challenger.id}_{opponent.id}"),
+                InlineKeyboardButton(text="❌ Отказаться", callback_data=f"duel_decline_{challenger.id}_{opponent.id}")
+            ]
+        ]
+    )
+
+    active_duel = {
+        "status": "pending",
+        "challenger": challenger,
+        "opponent": opponent,
+        "current_turn": None,
+        "timer_task": asyncio.create_task(duel_timeout_task(message.chat.id))
+    }
+
+    challenger_link = get_user_mention(challenger)
+    opponent_link = get_user_mention(opponent)
+
+    await message.answer(
+        f"⚔️ {challenger_link} вызывает {opponent_link} на дуэль!",
+        reply_markup=keyboard,
+        disable_web_page_preview=True
+    )
+
+
+@dp.message(F.text.lower().in_(["отмена дуэли", "стоп дуэль", "отмена"]))
+async def cancel_duel_command(message: Message):
+    global active_duel
+    if not active_duel:
+        return
+
+    user_id = message.from_user.id
+    if user_id in [active_duel["challenger"].id, active_duel["opponent"].id] or is_admin(user_id):
+        cancel_duel_timer()
+        active_duel = None
+        await message.reply("🛑 Дуэль была успешно отменена.")
+    else:
+        await message.reply("❌ Вы не участвуете в текущей дуэли.")
+
+
+@dp.callback_query(F.data.startswith("duel_accept_"))
+async def accept_duel_callback(callback: CallbackQuery):
+    global active_duel
+
+    if not active_duel or active_duel["status"] != "pending":
+        await callback.answer("Дуэль больше недоступна.", show_alert=True)
+        return
+
+    parts = callback.data.split("_")
+    opponent_id = int(parts[3])
+
+    if callback.from_user.id != opponent_id:
+        await callback.answer("Эта кнопка не для вас!", show_alert=True)
+        return
+
+    first, second = random.sample([active_duel["challenger"], active_duel["opponent"]], 2)
+    active_duel["status"] = "active"
+    active_duel["current_turn"] = first.id
+    reset_duel_timer(callback.message.chat.id)
+
+    first_mention = get_user_mention(first)
+
+    await callback.message.edit_text(
+        f"⚔️ <b>Дуэль началась!</b>\n\n"
+        f"🎯 Первым ходит: {first_mention}\n\n"
+        f"Чтобы ударить, напишите:\n<code>удар</code>",
+        disable_web_page_preview=True
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("duel_decline_"))
+async def decline_duel_callback(callback: CallbackQuery):
+    global active_duel
+
+    if not active_duel or active_duel["status"] != "pending":
+        await callback.answer("Дуэль больше недоступна.", show_alert=True)
+        return
+
+    parts = callback.data.split("_")
+    opponent_id = int(parts[3])
+
+    if callback.from_user.id != opponent_id:
+        await callback.answer("Эта кнопка не для вас!", show_alert=True)
+        return
+
+    cancel_duel_timer()
+    opponent_mention = get_user_mention(active_duel["opponent"])
+    active_duel = None
+
+    await callback.message.edit_text(
+        f"❌ {opponent_mention} отказался от дуэли.",
+        disable_web_page_preview=True
+    )
+    await callback.answer()
+
+
+@dp.message(F.text.lower().in_(["удар", "ударить"]))
+async def make_duel_hit(message: Message):
+    global active_duel
+
+    if not active_duel or active_duel["status"] != "active":
+        return
+
+    sender = message.from_user
+    p1 = active_duel["challenger"]
+    p2 = active_duel["opponent"]
+
+    if sender.id not in [p1.id, p2.id]:
+        return
+
+    if sender.id != active_duel["current_turn"]:
+        await message.reply("⏳ Сейчас не ваш ход.")
+        return
+
+    reset_duel_timer(message.chat.id)
+    
+    attacker = sender
+    defender = p2 if sender.id == p1.id else p1
+
+    attacker_mention = get_user_mention(attacker)
+    defender_mention = get_user_mention(defender)
+
+    is_finish = random.random() < 0.30
+
+    if is_finish:
+        cancel_duel_timer()
+        def_bal = get_balance(defender.id)
+        stolen = min(def_bal, 3)
+
+        if stolen > 0:
+            with db_lock:
+                try:
+                    cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (stolen, defender.id))
+                    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (stolen, attacker.id))
+                    db.commit()
+                except Exception as e:
+                    db.rollback()
+                    print(f"Ошибка перевода денег дуэли: {e}")
+            add_history(defender.id, attacker.id, stolen, "duel_win")
+
+        active_duel = None
+
+        text = (
+            f"💥 {attacker_mention} мощно врезал ладушкой по {defender_mention}!\n\n"
+            f"🏆 <b>Победитель:</b> {attacker_mention}\n\n"
+            f"💰 {attacker_mention} получает {stolen} ладушки.\n"
+            f"💸 {defender_mention} теряет {stolen} ладушки."
+        )
+        await message.answer(text, disable_web_page_preview=True)
+    else:
+        active_duel["current_turn"] = defender.id
+        text = (
+            f"👏 {attacker_mention} ударил ладушкой {defender_mention}!\n\n"
+            f"🎯 Теперь ходит:\n{defender_mention}\n\n"
+            f"Напишите:\n<code>удар</code>"
+        )
+        await message.answer(text, disable_web_page_preview=True)
 
 
 # ==========================
@@ -316,6 +636,8 @@ async def start(message: Message):
         "• Напишите <b>профиль</b> — чтобы посмотреть свой профиль.\n"
         "• Напишите <b>баланс</b> — чтобы узнать счет.\n"
         "• Напишите <b>бонус</b> — чтобы получить ежедневный бонус.\n"
+        "• Напишите <b>дуэль</b> — вызвать игрока на дуэль (ответом на сообщение).\n"
+        "• Напишите <b>отмена</b> — отменить дуэль.\n"
         "• Напишите <b>магазин</b> — чтобы открыть магазин предметов.\n"
         "• Напишите <b>инвентарь</b> — чтобы посмотреть свои предметы.\n"
         "• Напишите <b>репутация</b> — чтобы увидеть ТОП-5 по репутации.\n"
@@ -396,11 +718,16 @@ async def get_daily_bonus(message: Message):
     reward = random.randint(1, 5)
 
     with db_lock:
-        cursor.execute(
-            "UPDATE users SET balance = balance + ?, last_bonus = ? WHERE user_id=?",
-            (reward, now.isoformat(), user.id)
-        )
-        db.commit()
+        try:
+            cursor.execute(
+                "UPDATE users SET balance = balance + ?, last_bonus = ? WHERE user_id=?",
+                (reward, now.isoformat(), user.id)
+            )
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"Ошибка получения бонуса: {e}")
+            return
 
     add_history(0, user.id, reward, "daily_bonus")
 
@@ -435,12 +762,17 @@ async def buy_battle_ladushka(message: Message):
     price = 200
     
     with db_lock:
-        cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (price, user.id, price))
-        if cursor.rowcount == 0:
-            user_bal = get_balance(user.id)
-            await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{user_bal}</b> ладушек")
+        try:
+            cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (price, user.id, price))
+            if cursor.rowcount == 0:
+                user_bal = get_balance(user.id)
+                await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{user_bal}</b> ладушек")
+                return
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"Ошибка покупки: {e}")
             return
-        db.commit()
     
     add_item(user.id, "battle_ladushka", 1)
     add_history(user.id, 0, price, "buy_item", "Боевая ладушка")
@@ -460,12 +792,17 @@ async def buy_tomato(message: Message):
     price = 100
 
     with db_lock:
-        cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (price, user.id, price))
-        if cursor.rowcount == 0:
-            user_bal = get_balance(user.id)
-            await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{user_bal}</b> ладушек")
+        try:
+            cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (price, user.id, price))
+            if cursor.rowcount == 0:
+                user_bal = get_balance(user.id)
+                await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{user_bal}</b> ладушек")
+                return
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"Ошибка покупки: {e}")
             return
-        db.commit()
     
     add_item(user.id, "tomato", 1)
     add_history(user.id, 0, price, "buy_item", "Томат")
@@ -485,12 +822,17 @@ async def buy_rat(message: Message):
     price = 250
 
     with db_lock:
-        cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (price, user.id, price))
-        if cursor.rowcount == 0:
-            user_bal = get_balance(user.id)
-            await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{user_bal}</b> ладушек")
+        try:
+            cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (price, user.id, price))
+            if cursor.rowcount == 0:
+                user_bal = get_balance(user.id)
+                await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{user_bal}</b> ладушек")
+                return
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"Ошибка покупки: {e}")
             return
-        db.commit()
     
     add_item(user.id, "rat", 1)
     add_history(user.id, 0, price, "buy_item", "Крыса")
@@ -621,9 +963,14 @@ async def use_rat(message: Message):
     elif target_bal < wanted_steal:
         stolen = target_bal
         with db_lock:
-            cursor.execute("UPDATE users SET balance = 0 WHERE user_id=?", (target_id,))
-            cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (stolen, sender.id))
-            db.commit()
+            try:
+                cursor.execute("UPDATE users SET balance = 0 WHERE user_id=?", (target_id,))
+                cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (stolen, sender.id))
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                print(f"Ошибка кражи: {e}")
+                return
         add_history(target_id, sender.id, stolen, "rat_steal")
 
         await message.reply(
@@ -634,9 +981,14 @@ async def use_rat(message: Message):
     else:
         stolen = wanted_steal
         with db_lock:
-            cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (stolen, target_id))
-            cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (stolen, sender.id))
-            db.commit()
+            try:
+                cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (stolen, target_id))
+                cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (stolen, sender.id))
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                print(f"Ошибка кражи: {e}")
+                return
         add_history(target_id, sender.id, stolen, "rat_steal")
 
         await message.reply(f"🐀 Крыса пробралась к {target_name}!\n\n💸 Украдено: {stolen} ладушки")
@@ -671,14 +1023,19 @@ async def transfer_custom_amount(message: Message):
     register_user(receiver)
 
     with db_lock:
-        cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (amount, sender.id, amount))
-        if cursor.rowcount == 0:
-            sender_balance = get_balance(sender.id)
-            await message.reply(f"❌ <b>Недостаточно средств!</b>\nУ вас на балансе: <b>{sender_balance}</b> ладушек.")
-            return
+        try:
+            cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (amount, sender.id, amount))
+            if cursor.rowcount == 0:
+                sender_balance = get_balance(sender.id)
+                await message.reply(f"❌ <b>Недостаточно средств!</b>\nУ вас на балансе: <b>{sender_balance}</b> ладушек.")
+                return
 
-        cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, receiver.id))
-        db.commit()
+            cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, receiver.id))
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"Ошибка перевода: {e}")
+            return
 
     add_history(sender.id, receiver.id, amount, "transfer")
 
@@ -721,13 +1078,18 @@ async def transfer_one_ladushka(message: Message):
     register_user(receiver)
 
     with db_lock:
-        cursor.execute("UPDATE users SET balance = balance - 1 WHERE user_id=? AND balance >= 1", (sender.id,))
-        if cursor.rowcount == 0:
-            await message.reply("❌ У вас нет ладушек.")
-            return
+        try:
+            cursor.execute("UPDATE users SET balance = balance - 1 WHERE user_id=? AND balance >= 1", (sender.id,))
+            if cursor.rowcount == 0:
+                await message.reply("❌ У вас нет ладушек.")
+                return
 
-        cursor.execute("UPDATE users SET balance = balance + 1 WHERE user_id=?", (receiver.id,))
-        db.commit()
+            cursor.execute("UPDATE users SET balance = balance + 1 WHERE user_id=?", (receiver.id,))
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"Ошибка передачи ладушки: {e}")
+            return
 
     add_history(sender.id, receiver.id, 1, "transfer")
 
@@ -818,8 +1180,13 @@ async def add_reputation(message: Message):
 
     new_rep = current_rep + 1
     with db_lock:
-        cursor.execute("UPDATE users SET reputation=? WHERE user_id=?", (new_rep, target.id))
-        db.commit()
+        try:
+            cursor.execute("UPDATE users SET reputation=? WHERE user_id=?", (new_rep, target.id))
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"Ошибка репутации: {e}")
+            return
     save_db_changes()
 
     await message.reply(
@@ -853,8 +1220,13 @@ async def remove_reputation(message: Message):
 
     new_rep = current_rep - 1
     with db_lock:
-        cursor.execute("UPDATE users SET reputation=? WHERE user_id=?", (new_rep, target.id))
-        db.commit()
+        try:
+            cursor.execute("UPDATE users SET reputation=? WHERE user_id=?", (new_rep, target.id))
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"Ошибка репутации: {e}")
+            return
     save_db_changes()
 
     await message.reply(
@@ -922,8 +1294,13 @@ async def fine_handler(message: Message):
     if current_bal < fine_amount:
         deducted = current_bal
         with db_lock:
-            cursor.execute("UPDATE users SET balance = 0 WHERE user_id=?", (target.id,))
-            db.commit()
+            try:
+                cursor.execute("UPDATE users SET balance = 0 WHERE user_id=?", (target.id,))
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                print(f"Ошибка списания штрафа: {e}")
+                return
         add_history(ADMIN_ID, target.id, deducted, "fine")
 
         await message.reply(
@@ -936,8 +1313,13 @@ async def fine_handler(message: Message):
     else:
         new_bal = current_bal - fine_amount
         with db_lock:
-            cursor.execute("UPDATE users SET balance = ? WHERE user_id=?", (new_bal, target.id))
-            db.commit()
+            try:
+                cursor.execute("UPDATE users SET balance = ? WHERE user_id=?", (new_bal, target.id))
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                print(f"Ошибка списания штрафа: {e}")
+                return
         add_history(ADMIN_ID, target.id, fine_amount, "fine")
 
         await message.reply(
@@ -966,8 +1348,13 @@ async def add_balance(message: Message):
     register_user(user)
 
     with db_lock:
-        cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user.id))
-        db.commit()
+        try:
+            cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user.id))
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"Ошибка изминения баланса: {e}")
+            return
 
     add_history(ADMIN_ID, user.id, amount, "add")
     user_link = get_user_mention(user)
@@ -988,8 +1375,13 @@ async def remove_balance(message: Message):
 
     user = message.reply_to_message.from_user
     with db_lock:
-        cursor.execute("UPDATE users SET balance = MAX(balance-?,0) WHERE user_id=?", (amount, user.id))
-        db.commit()
+        try:
+            cursor.execute("UPDATE users SET balance = MAX(balance-?,0) WHERE user_id=?", (amount, user.id))
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"Ошибка снятия баланса: {e}")
+            return
 
     add_history(ADMIN_ID, user.id, amount, "remove")
     await message.answer("✅ Ладушки сняты.")
@@ -1010,8 +1402,13 @@ async def set_balance(message: Message):
     user = message.reply_to_message.from_user
     register_user(user)
     with db_lock:
-        cursor.execute("UPDATE users SET balance=? WHERE user_id=?", (amount, user.id))
-        db.commit()
+        try:
+            cursor.execute("UPDATE users SET balance=? WHERE user_id=?", (amount, user.id))
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"Ошибка установки баланса: {e}")
+            return
     save_db_changes()
 
     await message.answer("✅ Баланс изменён.")
@@ -1032,8 +1429,13 @@ async def admin_bonus(message: Message):
     user = message.reply_to_message.from_user
     register_user(user)
     with db_lock:
-        cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user.id))
-        db.commit()
+        try:
+            cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user.id))
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"Ошибка админ-бонуса: {e}")
+            return
     
     add_history(ADMIN_ID, user.id, amount, "admin_bonus")
     user_link = get_user_mention(user)
@@ -1046,8 +1448,13 @@ async def reset(message: Message):
         return
     user = message.reply_to_message.from_user
     with db_lock:
-        cursor.execute("UPDATE users SET balance=0 WHERE user_id=?", (user.id,))
-        db.commit()
+        try:
+            cursor.execute("UPDATE users SET balance=0 WHERE user_id=?", (user.id,))
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"Ошибка сброса: {e}")
+            return
     save_db_changes()
 
     await message.answer("♻️ Баланс игрока сброшен.")
@@ -1095,6 +1502,16 @@ async def auto_ping_task():
             await asyncio.sleep(240)
 
 
+async def auto_backup_task():
+    """Фоновая задача: каждые 30 минут делает резервную копию базы данных"""
+    while True:
+        await asyncio.sleep(1800)  # 30 минут (1800 секунд)
+        try:
+            await asyncio.to_thread(create_backup)
+        except Exception as e:
+            print(f"🔴 Ошибка во время выполнения автоматического бэкапа: {e}")
+
+
 async def daily_ladushki_task():
     kyiv_tz = zoneinfo.ZoneInfo("Europe/Kyiv")
     
@@ -1123,6 +1540,7 @@ async def daily_ladushki_task():
 
 
 async def cleanup_db_task():
+    """Очищает устаревшую временную историю операций (баланс, инвентарь и профили останутся навсегда)"""
     while True:
         try:
             with db_lock:
@@ -1130,9 +1548,10 @@ async def cleanup_db_task():
                 cutoff_date = (datetime.now() - timedelta(days=14)).strftime("%Y-%m-%d %H:%M:%S")
                 cursor.execute("DELETE FROM history WHERE date < ?", (cutoff_date,))
                 db.commit()
-            print("🧹 Очистка базы данных завершена.")
+            print("🧹 Очистка временных данных в базе завершена.")
             save_db_changes()
         except Exception as e:
+            db.rollback()
             print(f"Ошибка при автоматической очистке БД: {e}")
 
         await asyncio.sleep(86400)
@@ -1141,7 +1560,12 @@ async def cleanup_db_task():
 async def main():
     await init_db()
     await start_web_server()
+    
+    # Первичный бэкап при старте бота
+    await asyncio.to_thread(create_backup)
+    
     asyncio.create_task(auto_ping_task())
+    asyncio.create_task(auto_backup_task())
     asyncio.create_task(daily_ladushki_task())
     asyncio.create_task(cleanup_db_task())
     
