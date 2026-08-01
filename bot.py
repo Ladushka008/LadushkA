@@ -71,10 +71,18 @@ def get_file_hash(filepath: str) -> str:
 
 
 def _sync_download():
-    """Скачивает базу данных из GitHub при старте бота, проверяя целостность и отличия через хеш"""
+    """
+    Скачивает базу данных из GitHub ТОЛЬКО если локальный файл базы отсутствует.
+    Если локальный файл существует и исправен, он берется за источник истины,
+    чтобы исключить откат балансов к старым значениям из remote-репозитория.
+    """
     if not GITHUB_TOKEN or not GITHUB_REPO:
         print("GitHub sync failed: missing token or repo")
         return False
+
+    if os.path.exists(DB_FILE):
+        print("🟡 Локальная база данных уже существует. Скачивание с GitHub пропущено.")
+        return True
 
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
     headers = {
@@ -88,14 +96,6 @@ def _sync_download():
             res_json = response.json()
             content_b64 = res_json.get("content", "")
             file_data = base64.b64decode(content_b64)
-
-            # Если локальный файл существует и его хеш совпадает с файлом из GitHub - пропускаем
-            if os.path.exists(DB_FILE):
-                remote_hash = hashlib.sha256(file_data).hexdigest()
-                local_hash = get_file_hash(DB_FILE)
-                if remote_hash == local_hash:
-                    print("🟡 Локальная база идентична базе из GitHub. Скачивание пропущено.")
-                    return True
 
             with db_lock:
                 with open(DB_FILE, "wb") as f:
@@ -155,7 +155,7 @@ def _sync_upload_single():
             print(f"⚠️ GitHub sync upload error: {e} (попытка {attempt}/{max_retries})")
 
         import time
-        time.sleep(2 * attempt)  # Пауза перед повторной попыткой
+        time.sleep(2 * attempt)
 
     return False
 
@@ -167,13 +167,11 @@ async def _github_sync_worker():
         await sync_event.wait()
         sync_event.clear()
 
-        # Задержка 7 секунд для пакетного объединения всех параллельных запросов
         await asyncio.sleep(7)
         is_db_dirty = False
 
         await asyncio.to_thread(_sync_upload_single)
 
-        # Если за время загрузки пришли новые изменения — взводим событие снова
         if is_db_dirty:
             sync_event.set()
 
@@ -265,7 +263,7 @@ async def init_db():
     global db, cursor
     # 1. Проверяем целостность локальной БД
     await asyncio.to_thread(check_and_restore_db)
-    # 2. Скачиваем актуальную версию из GitHub
+    # 2. Скачиваем актуальную версию из GitHub (только если локального файла нет)
     await asyncio.to_thread(_sync_download)
 
     # 3. Подключаемся к базе SQLite
@@ -323,7 +321,7 @@ async def init_db():
 
 
 # ==========================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (ТРАНЗАКЦИОННЫЕ)
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==========================
 
 def register_user(user):
@@ -1685,9 +1683,20 @@ async def cleanup_db_task():
         await asyncio.sleep(86400)
 
 
+async def on_shutdown():
+    """Гарантирует загрузку последних изменений на GitHub при остановке/перезапуске бота"""
+    global is_db_dirty
+    if is_db_dirty:
+        print("⏳ Загружаем последние локальные изменения в GitHub перед выключением...")
+        await asyncio.to_thread(_sync_upload_single)
+
+
 async def main():
     await init_db()
     await start_web_server()
+    
+    # Регистрируем хендлер завершения работы
+    dp.shutdown.register(on_shutdown)
     
     # Первичный бэкап при старте бота
     await asyncio.to_thread(create_backup)
