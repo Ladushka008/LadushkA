@@ -55,7 +55,7 @@ active_duel = None
 # ==========================
 
 def _sync_download():
-    """Скачивает базу данных из GitHub при старте бота"""
+    """Скачивает базу данных из GitHub при старте бота, проверяя чтобы не перезаписать более новую локальную базу"""
     if not GITHUB_TOKEN or not GITHUB_REPO:
         print("GitHub sync failed: missing token or repo")
         return False
@@ -69,8 +69,25 @@ def _sync_download():
     try:
         response = requests.get(url, headers=headers, params={"ref": BRANCH}, timeout=15)
         if response.status_code == 200:
-            content_b64 = response.json().get("content", "")
+            res_json = response.json()
+            content_b64 = res_json.get("content", "")
             file_data = base64.b64decode(content_b64)
+
+            # Проверка актуальности локальной базы
+            if os.path.exists(DB_FILE):
+                commit_sha = res_json.get("sha")
+                commit_url = f"https://api.github.com/repos/{GITHUB_REPO}/commits"
+                commit_resp = requests.get(commit_url, headers=headers, params={"path": GITHUB_FILE_PATH, "sha": BRANCH, "per_page": 1}, timeout=10)
+                
+                if commit_resp.status_code == 200 and len(commit_resp.json()) > 0:
+                    remote_date_str = commit_resp.json()[0]["commit"]["committer"]["date"]
+                    remote_dt = datetime.fromisoformat(remote_date_str.replace("Z", "+00:00"))
+                    local_dt = datetime.fromtimestamp(os.path.getmtime(DB_FILE), tz=zoneinfo.ZoneInfo("UTC"))
+                    
+                    if local_dt > remote_dt:
+                        print("🟡 Локальная база новее облачной. Скачивание пропущено.")
+                        return True
+
             with db_lock:
                 with open(DB_FILE, "wb") as f:
                     f.write(file_data)
@@ -168,7 +185,7 @@ def create_backup():
 
 
 def check_and_restore_db():
-    """Проверяет целостность БД. Если повреждена — восстанавливает из бэкапа."""
+    """Проверяет целостность БД. Восстанавливает только если файл повреждён."""
     if not os.path.exists(DB_FILE):
         print("ℹ️ Файл базы данных не найден. Будет создана новая БД.")
         return
@@ -212,9 +229,12 @@ def check_and_restore_db():
 
 async def init_db():
     global db, cursor
-    await asyncio.to_thread(_sync_download)
+    # 1. Сначала проверяем целостность локальной БД
     await asyncio.to_thread(check_and_restore_db)
+    # 2. Затем скачиваем актуальную версию из GitHub
+    await asyncio.to_thread(_sync_download)
 
+    # 3. Подключаемся к базе SQLite
     db = sqlite3.connect(DB_FILE, check_same_thread=False)
     cursor = db.cursor()
 
@@ -592,6 +612,7 @@ async def make_duel_hit(message: Message):
                 except Exception as e:
                     db.rollback()
                     print(f"Ошибка перевода денег дуэли: {e}")
+            save_db_changes()
             add_history(defender.id, attacker.id, stolen, "duel_win")
 
         active_duel = None
@@ -724,6 +745,7 @@ async def get_daily_bonus(message: Message):
             print(f"Ошибка получения бонуса: {e}")
             return
 
+    save_db_changes()
     add_history(0, user.id, reward, "daily_bonus")
 
     await message.reply(
@@ -769,6 +791,7 @@ async def buy_battle_ladushka(message: Message):
             print(f"Ошибка покупки: {e}")
             return
     
+    save_db_changes()
     add_item(user.id, "battle_ladushka", 1)
     add_history(user.id, 0, price, "buy_item", "Боевая ладушка")
 
@@ -799,6 +822,7 @@ async def buy_tomato(message: Message):
             print(f"Ошибка покупки: {e}")
             return
     
+    save_db_changes()
     add_item(user.id, "tomato", 1)
     add_history(user.id, 0, price, "buy_item", "Томат")
 
@@ -829,6 +853,7 @@ async def buy_rat(message: Message):
             print(f"Ошибка покупки: {e}")
             return
     
+    save_db_changes()
     add_item(user.id, "rat", 1)
     add_history(user.id, 0, price, "buy_item", "Крыса")
 
@@ -966,6 +991,7 @@ async def use_rat(message: Message):
                 db.rollback()
                 print(f"Ошибка кражи: {e}")
                 return
+        save_db_changes()
         add_history(target_id, sender.id, stolen, "rat_steal")
 
         await message.reply(
@@ -984,6 +1010,7 @@ async def use_rat(message: Message):
                 db.rollback()
                 print(f"Ошибка кражи: {e}")
                 return
+        save_db_changes()
         add_history(target_id, sender.id, stolen, "rat_steal")
 
         await message.reply(f"🐀 Крыса пробралась к {target_name}!\n\n💸 Украдено: {stolen} ладушки")
@@ -1032,6 +1059,7 @@ async def transfer_custom_amount(message: Message):
             print(f"Ошибка перевода: {e}")
             return
 
+    save_db_changes()
     add_history(sender.id, receiver.id, amount, "transfer")
 
     sender_new_bal = get_balance(sender.id)
@@ -1086,6 +1114,7 @@ async def transfer_one_ladushka(message: Message):
             print(f"Ошибка передачи ладушки: {e}")
             return
 
+    save_db_changes()
     add_history(sender.id, receiver.id, 1, "transfer")
 
     sender_mention = get_user_mention(sender)
@@ -1337,6 +1366,7 @@ async def fine_handler(message: Message):
                 db.rollback()
                 print(f"Ошибка списания штрафа: {e}")
                 return
+        save_db_changes()
         add_history(ADMIN_ID, target.id, deducted, "fine")
 
         await message.reply(
@@ -1356,6 +1386,7 @@ async def fine_handler(message: Message):
                 db.rollback()
                 print(f"Ошибка списания штрафа: {e}")
                 return
+        save_db_changes()
         add_history(ADMIN_ID, target.id, fine_amount, "fine")
 
         await message.reply(
@@ -1392,6 +1423,7 @@ async def add_balance(message: Message):
             print(f"Ошибка изминения баланса: {e}")
             return
 
+    save_db_changes()
     add_history(ADMIN_ID, user.id, amount, "add")
     user_link = get_user_mention(user)
     await message.answer(f"✅ {user_link} получил {amount} ладушек.", disable_web_page_preview=True)
@@ -1419,6 +1451,7 @@ async def remove_balance(message: Message):
             print(f"Ошибка снятия баланса: {e}")
             return
 
+    save_db_changes()
     add_history(ADMIN_ID, user.id, amount, "remove")
     await message.answer("✅ Ладушки сняты.")
 
@@ -1473,6 +1506,7 @@ async def admin_bonus(message: Message):
             print(f"Ошибка админ-бонуса: {e}")
             return
     
+    save_db_changes()
     add_history(ADMIN_ID, user.id, amount, "admin_bonus")
     user_link = get_user_mention(user)
     await message.answer(f"🎁 Игрок {user_link} получил бонус {amount} ладушек.", disable_web_page_preview=True)
