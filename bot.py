@@ -272,7 +272,7 @@ async def init_db():
 
     with db_lock:
         try:
-            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA journal_mode=DELETE")
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS users(
                 user_id INTEGER PRIMARY KEY,
