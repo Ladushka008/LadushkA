@@ -108,12 +108,6 @@ async def update_balance(user_id: int, amount: int) -> int:
         return await get_balance(user_id)
 
 
-async def set_balance(user_id: int, amount: int) -> None:
-    async with aiosqlite.connect(Config.DB_FILE) as db:
-        await db.execute("UPDATE users SET balance = ? WHERE user_id = ?", (amount, user_id))
-        await db.commit()
-
-
 async def claim_daily_bonus(user_id: int) -> Tuple[bool, int, Optional[timedelta]]:
     async with aiosqlite.connect(Config.DB_FILE) as db:
         async with db.execute("SELECT last_bonus FROM users WHERE user_id = ?", (user_id,)) as cursor:
