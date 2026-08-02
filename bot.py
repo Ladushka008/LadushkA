@@ -262,7 +262,7 @@ async def init_db():
 
     with db_lock:
         try:
-            cursor.execute("PRAGMA journal_mode=DELETE")
+            cursor.execute("PRAGMA journal_mode=WAL;")
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS users(
                 user_id INTEGER PRIMARY KEY,
@@ -315,54 +315,52 @@ async def init_db():
 # ==========================
 
 def is_user_registered(user_id: int) -> bool:
-    """Проверяет, существует ли пользователь в базе данных."""
+    """Проверяет, существует ли пользователь в базе данных исключительно по user_id."""
     with db_lock:
         cursor.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,))
         return cursor.fetchone() is not None
 
 
-def register_user(user):
+def ensure_user_registered(user):
     """
-    Вызывается ТОЛЬКО при команде /start.
-    Если пользователь новый — регистрирует. 
-    Если старый — лишь обновляет логин и имя, не затрагивая баланс.
+    Гарантирует регистрацию или обновление данных профиля.
+    Если пользователь существует — сохраняется текущий баланс и обновляются только username/full_name.
     """
-    if not user:
+    if not user or user.is_bot:
         return
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with db_lock:
         try:
             cursor.execute(
                 """
-                INSERT OR IGNORE INTO users(user_id, username, full_name, balance, last_bonus, created_at, reputation)
-                VALUES(?,?,?,0,NULL,?,0)
+                INSERT INTO users(user_id, username, full_name, balance, last_bonus, created_at, reputation)
+                VALUES(?, ?, ?, 0, NULL, ?, 0)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username = excluded.username,
+                    full_name = excluded.full_name
                 """,
                 (user.id, user.username, user.full_name, now_str)
-            )
-            cursor.execute(
-                """
-                UPDATE users
-                SET username=?, full_name=?
-                WHERE user_id=?
-                """,
-                (user.username, user.full_name, user.id)
             )
             db.commit()
         except Exception as e:
             db.rollback()
-            print(f"Ошибка регистрации пользователя: {e}")
-            return
-    save_db_changes()
+            print(f"Ошибка гарантированной регистрации пользователя: {e}")
 
 
-def get_balance(user_id):
+def register_user(user):
+    """Регистрирует пользователя безопасным образом без риска затирания баланса."""
+    ensure_user_registered(user)
+
+
+def get_balance(user_id: int) -> int:
+    """Получает единый баланс строго по user_id."""
     with db_lock:
         cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
         row = cursor.fetchone()
     return row[0] if row else 0
 
 
-def get_reputation(user_id):
+def get_reputation(user_id: int) -> int:
     with db_lock:
         cursor.execute("SELECT reputation FROM users WHERE user_id=?", (user_id,))
         row = cursor.fetchone()
@@ -379,7 +377,7 @@ def get_user_mention(user):
     return f'<a href="{url}">{user.full_name}</a>'
 
 
-def get_total_items_count(user_id):
+def get_total_items_count(user_id: int) -> int:
     with db_lock:
         cursor.execute("SELECT SUM(quantity) FROM inventory WHERE user_id=? AND quantity > 0", (user_id,))
         row = cursor.fetchone()
@@ -468,7 +466,6 @@ async def bot_reply(message: Message):
 
 @dp.message(Command("start"))
 async def start(message: Message):
-    # Единственное место, где новые пользователи регистрируются
     register_user(message.from_user)
     await message.answer(
         "✨ <b>Добро пожаловать в бота сообщества Ладушки!</b>\n\n"
@@ -495,11 +492,8 @@ async def start(message: Message):
 @dp.message(F.text.lower().startswith("баскет"))
 async def basketball_game(message: Message):
     user = message.from_user
-    if not is_user_registered(user.id):
-        await message.reply("⚠️ Вы еще не зарегистрированы.\nПожалуйста, сначала откройте бота и нажмите /start.")
-        return
+    ensure_user_registered(user)
 
-    # Извлекаем сумму из аргументов (например: "баскетбол 100" или "/basketball 100")
     parts = message.text.split()
     if len(parts) < 2 or not parts[1].isdigit():
         await message.reply("⚠️ Укажите сумму числом. Пример: <code>баскетбол 50</code>")
@@ -510,22 +504,18 @@ async def basketball_game(message: Message):
         await message.reply("❌ Сумма должна быть больше 0.")
         return
 
-    # Проверяем, достаточно ли у пользователя средств
     current_balance = get_balance(user.id)
     if current_balance < amount:
         await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{current_balance}</b> ладушек")
         return
 
-    # 1. Отправляем кубик баскетбола
     dice_msg = await message.answer_dice(emoji="🏀")
     score = dice_msg.dice.value
 
-    # 2. Ждем окончания анимации Telegram (около 3.5 сек)
     await asyncio.sleep(3.5)
 
-    # 3. Значения 4 и 5 соответствуют попаданию в корзину
     if score >= 4:
-        reward = int(amount * 0.3)  # +30% от указанной суммы
+        reward = int(amount * 0.3)
         with db_lock:
             try:
                 cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (reward, user.id))
@@ -546,7 +536,7 @@ async def basketball_game(message: Message):
             f"🪙 Ваш баланс: <b>{new_balance}</b>"
         )
     else:
-        loss = amount  # При промахе списывается указанная сумма
+        loss = amount
 
         with db_lock:
             try:
@@ -571,16 +561,10 @@ async def basketball_game(message: Message):
 
 @dp.message(F.text.lower() == "профиль")
 async def profile_handler(message: Message):
-    if not is_user_registered(message.from_user.id):
-        await message.reply("⚠️ Вы еще не зарегистрированы.\nПожалуйста, сначала откройте бота и нажмите /start.")
-        return
+    ensure_user_registered(message.from_user)
 
     target = message.reply_to_message.from_user if (message.reply_to_message and message.reply_to_message.from_user) else message.from_user
-
-    if not is_user_registered(target.id):
-        target_name = target.full_name
-        await message.reply(f"⚠️ Пользователь {target_name} еще не зарегистрирован.\nПопросите его сначала открыть бота и нажать /start.")
-        return
+    ensure_user_registered(target)
 
     user_balance = get_balance(target.id)
     items_count = get_total_items_count(target.id)
@@ -598,18 +582,12 @@ async def profile_handler(message: Message):
 
 @dp.message(F.text.lower() == "баланс")
 async def balance(message: Message):
-    if not is_user_registered(message.from_user.id):
-        await message.reply("⚠️ Вы еще не зарегистрированы.\nПожалуйста, сначала откройте бота и нажмите /start.")
-        return
+    ensure_user_registered(message.from_user)
 
     target = message.from_user
     if message.reply_to_message and message.reply_to_message.from_user:
         target = message.reply_to_message.from_user
-
-    if not is_user_registered(target.id):
-        target_name = target.full_name
-        await message.reply(f"⚠️ Пользователь {target_name} еще не зарегистрирован.\nПопросите его сначала открыть бота и нажать /start.")
-        return
+        ensure_user_registered(target)
 
     user_balance = get_balance(target.id)
     user_link = get_user_mention(target)
@@ -625,9 +603,7 @@ async def balance(message: Message):
 @dp.message(F.text.lower() == "бонус")
 async def get_daily_bonus(message: Message):
     user = message.from_user
-    if not is_user_registered(user.id):
-        await message.reply("⚠️ Вы еще не зарегистрированы.\nПожалуйста, сначала откройте бота и нажмите /start.")
-        return
+    ensure_user_registered(user)
 
     now = datetime.now()
 
@@ -692,9 +668,7 @@ async def shop_handler(message: Message):
 @dp.message(F.text.lower() == "купить ладушка")
 async def buy_battle_ladushka(message: Message):
     user = message.from_user
-    if not is_user_registered(user.id):
-        await message.reply("⚠️ Вы еще не зарегистрированы.\nПожалуйста, сначала откройте бота и нажмите /start.")
-        return
+    ensure_user_registered(user)
     
     price = 200
     
@@ -727,9 +701,7 @@ async def buy_battle_ladushka(message: Message):
 @dp.message(F.text.lower() == "купить томат")
 async def buy_tomato(message: Message):
     user = message.from_user
-    if not is_user_registered(user.id):
-        await message.reply("⚠️ Вы еще не зарегистрированы.\nПожалуйста, сначала откройте бота и нажмите /start.")
-        return
+    ensure_user_registered(user)
     
     price = 100
 
@@ -762,9 +734,7 @@ async def buy_tomato(message: Message):
 @dp.message(F.text.lower() == "купить крыса")
 async def buy_rat(message: Message):
     user = message.from_user
-    if not is_user_registered(user.id):
-        await message.reply("⚠️ Вы еще не зарегистрированы.\nПожалуйста, сначала откройте бота и нажмите /start.")
-        return
+    ensure_user_registered(user)
     
     price = 250
 
@@ -797,9 +767,7 @@ async def buy_rat(message: Message):
 @dp.message(F.text.lower() == "инвентарь")
 async def inventory_handler(message: Message):
     user = message.from_user
-    if not is_user_registered(user.id):
-        await message.reply("⚠️ Вы еще не зарегистрированы.\nПожалуйста, сначала откройте бота и нажмите /start.")
-        return
+    ensure_user_registered(user)
 
     with db_lock:
         cursor.execute("SELECT item_name, quantity FROM inventory WHERE user_id=? AND quantity > 0", (user.id,))
@@ -825,9 +793,7 @@ async def inventory_handler(message: Message):
 
 @dp.message(F.text.lower() == "ударить ладушкой")
 async def hit_with_ladushka(message: Message):
-    if not is_user_registered(message.from_user.id):
-        await message.reply("⚠️ Вы еще не зарегистрированы.\nПожалуйста, сначала откройте бота и нажмите /start.")
-        return
+    ensure_user_registered(message.from_user)
 
     if not message.reply_to_message or not message.reply_to_message.from_user:
         await message.reply("⚠️ Эта команда должна быть ответом на сообщение пользователя!")
@@ -835,10 +801,7 @@ async def hit_with_ladushka(message: Message):
 
     sender = message.from_user
     receiver = message.reply_to_message.from_user
-
-    if not is_user_registered(receiver.id):
-        await message.reply(f"⚠️ Пользователь {receiver.full_name} еще не зарегистрирован.\nПопросите его сначала открыть бота и нажать /start.")
-        return
+    ensure_user_registered(receiver)
 
     count = get_item_quantity(sender.id, "battle_ladushka")
     if count <= 0:
@@ -862,9 +825,7 @@ async def hit_with_ladushka(message: Message):
 
 @dp.message(F.text.lower() == "кинуть томат")
 async def throw_tomato(message: Message):
-    if not is_user_registered(message.from_user.id):
-        await message.reply("⚠️ Вы еще не зарегистрированы.\nПожалуйста, сначала откройте бота и нажмите /start.")
-        return
+    ensure_user_registered(message.from_user)
 
     if not message.reply_to_message or not message.reply_to_message.from_user:
         await message.reply("⚠️ Эта команда должна быть ответом на сообщение пользователя!")
@@ -872,10 +833,7 @@ async def throw_tomato(message: Message):
 
     sender = message.from_user
     receiver = message.reply_to_message.from_user
-
-    if not is_user_registered(receiver.id):
-        await message.reply(f"⚠️ Пользователь {receiver.full_name} еще не зарегистрирован.\nПопросите его сначала открыть бота и нажать /start.")
-        return
+    ensure_user_registered(receiver)
 
     count = get_item_quantity(sender.id, "tomato")
     if count <= 0:
@@ -900,16 +858,13 @@ async def throw_tomato(message: Message):
 @dp.message(F.text.lower() == "крыса")
 async def use_rat(message: Message):
     sender = message.from_user
-    if not is_user_registered(sender.id):
-        await message.reply("⚠️ Вы еще не зарегистрированы.\nПожалуйста, сначала откройте бота и нажмите /start.")
-        return
+    ensure_user_registered(sender)
 
     count = get_item_quantity(sender.id, "rat")
     if count <= 0:
         await message.reply("❌ У вас нет крысы.")
         return
 
-    # Воруем только у тех, кто есть в базе данных
     with db_lock:
         cursor.execute("SELECT user_id, full_name, balance FROM users WHERE user_id != ?", (sender.id,))
         targets = cursor.fetchall()
@@ -965,18 +920,15 @@ async def use_rat(message: Message):
 
 @dp.message(F.text.lower().startswith("дать "))
 async def transfer_custom_amount(message: Message):
-    if not is_user_registered(message.from_user.id):
-        await message.reply("⚠️ Вы еще не зарегистрированы.\nПожалуйста, сначала откройте бота и нажмите /start.")
-        return
+    sender = message.from_user
+    ensure_user_registered(sender)
 
     if not message.reply_to_message or not message.reply_to_message.from_user:
         await message.reply("⚠️ Эта команда должна быть ответом на сообщение пользователя!")
         return
 
     receiver = message.reply_to_message.from_user
-    if not is_user_registered(receiver.id):
-        await message.reply(f"⚠️ Пользователь {receiver.full_name} еще не зарегистрирован.\nПопросите его сначала открыть бота и нажать /start.")
-        return
+    ensure_user_registered(receiver)
 
     parts = message.text.split()
     if len(parts) < 2 or not parts[1].isdigit():
@@ -987,8 +939,6 @@ async def transfer_custom_amount(message: Message):
     if amount <= 0:
         await message.reply("❌ Сумма перевода должна быть больше 0.")
         return
-
-    sender = message.from_user
 
     if sender.id == receiver.id:
         await message.reply("❌ Нельзя переводить ладушки самому себе.")
@@ -1034,9 +984,7 @@ async def transfer_custom_amount(message: Message):
 @dp.message(F.text.lower().in_(["подарок", "ладошка"]))
 async def transfer_one_ladushka(message: Message):
     sender = message.from_user
-    if not is_user_registered(sender.id):
-        await message.reply("⚠️ Вы еще не зарегистрированы.\nПожалуйста, сначала откройте бота и нажмите /start.")
-        return
+    ensure_user_registered(sender)
 
     if not message.reply_to_message or not message.reply_to_message.from_user:
         await message.reply("⚠️ Ответьте на сообщение игрока, чтобы передать ладушку!")
@@ -1048,9 +996,7 @@ async def transfer_one_ladushka(message: Message):
         await message.reply("🤖 Нельзя передавать ладушки боту.")
         return
 
-    if not is_user_registered(receiver.id):
-        await message.reply(f"⚠️ Пользователь {receiver.full_name} еще не зарегистрирован.\nПопросите его сначала открыть бота и нажать /start.")
-        return
+    ensure_user_registered(receiver)
 
     if sender.id == receiver.id:
         await message.reply("❌ Нельзя дарить ладушки самому себе.")
@@ -1113,9 +1059,7 @@ async def top_players(message: Message):
 
 @dp.message(Command("history"))
 async def history(message: Message):
-    if not is_user_registered(message.from_user.id):
-        await message.reply("⚠️ Вы еще не зарегистрированы.\nПожалуйста, сначала откройте бота и нажмите /start.")
-        return
+    ensure_user_registered(message.from_user)
 
     with db_lock:
         cursor.execute("""
@@ -1155,9 +1099,7 @@ async def add_reputation(message: Message):
         await message.reply("🤖 Боту нельзя выдавать репутацию.")
         return
 
-    if not is_user_registered(target.id):
-        await message.reply(f"⚠️ Пользователь {target.full_name} еще не зарегистрирован.\nПопросите его сначала открыть бота и нажать /start.")
-        return
+    ensure_user_registered(target)
 
     with db_lock:
         cursor.execute("SELECT reputation FROM users WHERE user_id=?", (target.id,))
@@ -1201,9 +1143,7 @@ async def remove_reputation(message: Message):
         await message.reply("🤖 Боту нельзя выдавать репутацию.")
         return
 
-    if not is_user_registered(target.id):
-        await message.reply(f"⚠️ Пользователь {target.full_name} еще не зарегистрирован.\nПопросите его сначала открыть бота и нажать /start.")
-        return
+    ensure_user_registered(target)
 
     with db_lock:
         cursor.execute("SELECT reputation FROM users WHERE user_id=?", (target.id,))
@@ -1312,9 +1252,7 @@ async def fine_handler(message: Message):
         await message.reply("🤖 Бота нельзя штрафовать.")
         return
 
-    if not is_user_registered(target.id):
-        await message.reply(f"⚠️ Пользователь {target.full_name} еще не зарегистрирован.\nПопросите его сначала открыть бота и нажать /start.")
-        return
+    ensure_user_registered(target)
 
     parts = message.text.split()
     if len(parts) < 2 or not parts[1].isdigit():
@@ -1377,9 +1315,7 @@ async def add_balance(message: Message):
         return
 
     user = message.reply_to_message.from_user
-    if not is_user_registered(user.id):
-        await message.reply(f"⚠️ Пользователь {user.full_name} еще не зарегистрирован.\nПопросите его сначала открыть бота и нажать /start.")
-        return
+    ensure_user_registered(user)
 
     args = message.text.split()
     if len(args) != 2:
@@ -1412,9 +1348,7 @@ async def remove_balance(message: Message):
         return
 
     user = message.reply_to_message.from_user
-    if not is_user_registered(user.id):
-        await message.reply(f"⚠️ Пользователь {user.full_name} еще не зарегистрирован.\nПопросите его сначала открыть бота и нажать /start.")
-        return
+    ensure_user_registered(user)
 
     args = message.text.split()
     if len(args) != 2:
@@ -1444,9 +1378,7 @@ async def set_balance(message: Message):
         return
 
     user = message.reply_to_message.from_user
-    if not is_user_registered(user.id):
-        await message.reply(f"⚠️ Пользователь {user.full_name} еще не зарегистрирован.\nПопросите его сначала открыть бота и нажать /start.")
-        return
+    ensure_user_registered(user)
 
     args = message.text.split()
     if len(args) != 2:
@@ -1475,9 +1407,7 @@ async def admin_bonus(message: Message):
         return
 
     user = message.reply_to_message.from_user
-    if not is_user_registered(user.id):
-        await message.reply(f"⚠️ Пользователь {user.full_name} еще не зарегистрирован.\nПопросите его сначала открыть бота и нажать /start.")
-        return
+    ensure_user_registered(user)
 
     args = message.text.split()
     if len(args) < 2:
@@ -1508,9 +1438,7 @@ async def reset(message: Message):
         return
 
     user = message.reply_to_message.from_user
-    if not is_user_registered(user.id):
-        await message.reply(f"⚠️ Пользователь {user.full_name} еще не зарегистрирован.\nПопросите его сначала открыть бота и нажать /start.")
-        return
+    ensure_user_registered(user)
 
     with db_lock:
         try:
