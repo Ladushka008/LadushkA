@@ -9,7 +9,7 @@ from aiogram.client.default import DefaultBotProperties
 
 from config import Config
 import database as db
-from github_storage import download_database
+from github_storage import download_database, upload_database
 from handlers import router
 
 logging.basicConfig(
@@ -58,6 +58,16 @@ async def daily_ladushki_task(bot: Bot) -> None:
             logging.error(f"🔴 Ошибка отправки ежедневного сообщения: {e}")
 
 
+async def github_sync_task() -> None:
+    """Фоновая выгрузка базы данных в GitHub каждые 5 минут."""
+    while True:
+        await asyncio.sleep(300)  # Интервал в секундах (5 минут)
+        try:
+            await upload_database()
+        except Exception as e:
+            logging.error(f"🔴 Ошибка фоновой выгрузки в GitHub: {e}")
+
+
 async def main() -> None:
     # 1. Скачиваем базу данных из GitHub (если она там есть)
     await download_database()
@@ -75,13 +85,17 @@ async def main() -> None:
     dp = Dispatcher()
     dp.include_router(router)
 
-    # Старт фоновой задачи 19:00
+    # Запуск фоновых задач
     asyncio.create_task(daily_ladushki_task(bot))
+    asyncio.create_task(github_sync_task())
 
-    # Сброс вебхука и запуск поллинга
-    await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("🚀 Бот полностью готов и запущен!")
-    await dp.start_polling(bot)
+    logging.info("🚀 Бот запущен!")
+    try:
+        await dp.start_polling(bot)
+    finally:
+        # Сохраняем актуальную БД при остановке бота
+        logging.info("💾 Сохранение базы данных перед выключением...")
+        await upload_database()
 
 
 if __name__ == "__main__":
