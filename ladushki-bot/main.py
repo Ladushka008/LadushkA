@@ -19,12 +19,10 @@ logging.basicConfig(
 
 
 async def handle_ping(request: web.Request) -> web.Response:
-    """Эндпоинт healthcheck для Render."""
-    return web.Response(text="Bot is operational with async SQLite storage!")
+    return web.Response(text="Bot is operational!")
 
 
 async def start_web_server() -> None:
-    """Запуск веб-сервера aiohttp."""
     app = web.Application()
     app.router.add_get("/", handle_ping)
     runner = web.AppRunner(app)
@@ -35,7 +33,6 @@ async def start_web_server() -> None:
 
 
 async def daily_ladushki_task(bot: Bot) -> None:
-    """Ежедневное фоновое задание отправки 'Ладушек' в 19:00 по киевскому времени."""
     kyiv_tz = zoneinfo.ZoneInfo("Europe/Kyiv")
     while True:
         now = datetime.now(kyiv_tz)
@@ -59,23 +56,23 @@ async def daily_ladushki_task(bot: Bot) -> None:
 
 
 async def github_sync_task() -> None:
-    """Фоновая выгрузка базы данных в GitHub каждые 5 минут."""
+    """Фоновое резервное копирование в GitHub раз в 5 минут."""
     while True:
-        await asyncio.sleep(300)  # Интервал в секундах (5 минут)
+        await asyncio.sleep(300)
         try:
             await upload_database()
         except Exception as e:
-            logging.error(f"🔴 Ошибка фоновой выгрузки в GitHub: {e}")
+            logging.error(f"🔴 Ошибка выгрузки в GitHub: {e}")
 
 
 async def main() -> None:
-    # 1. Скачиваем базу данных из GitHub (если она там есть)
+    # 1. Скачиваем актуальную БД при старте
     await download_database()
 
-    # 2. Инициализация БД
+    # 2. Инициализируем таблицы SQLite
     await db.init_db()
 
-    # 3. Запуск веб-сервера
+    # 3. Запускаем встроенный веб-сервер
     await start_web_server()
 
     bot = Bot(
@@ -85,16 +82,15 @@ async def main() -> None:
     dp = Dispatcher()
     dp.include_router(router)
 
-    # Запуск фоновых задач
+    # 4. Фоновое сопровождение
     asyncio.create_task(daily_ladushki_task(bot))
     asyncio.create_task(github_sync_task())
 
-    logging.info("🚀 Бот запущен!")
+    logging.info("🚀 Бот успешно запущен!")
     try:
         await dp.start_polling(bot)
     finally:
-        # Сохраняем актуальную БД при остановке бота
-        logging.info("💾 Сохранение базы данных перед выключением...")
+        logging.info("💾 Финальное сохранение БД в GitHub перед выключением...")
         await upload_database()
 
 
