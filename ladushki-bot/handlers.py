@@ -100,12 +100,27 @@ async def titles_shop_handler(message: Message):
     await message.answer(text)
 
 
-@router.message(F.text.func(lambda text: text and any(info["name"].lower() == text.lower() for info in db.TITLES.values())))
+# Обновленный хэндлер запроса покупки титула
+@router.message(F.text)
 async def title_buy_request(message: Message):
+    user_text = message.text.strip().lower()
+
+    # Поиск соответствующего титула в базе
+    matched_key = None
+    for key, info in db.TITLES.items():
+        title_name = info["name"].lower()
+        # Проверка прямого совпадения или вхождения слова (например, "деревянный ладушник" без эмодзи)
+        if user_text == title_name or user_text in title_name or title_name in user_text:
+            matched_key = key
+            break
+
+    # Если отправленный текст не соответствует ни одному титулу — пропускаем
+    if not matched_key:
+        return
+
     user = message.from_user
     await db.ensure_user(user.id, user.username, user.full_name)
 
-    matched_key = next(k for k, v in db.TITLES.items() if v["name"].lower() == message.text.lower())
     title_info = db.TITLES[matched_key]
 
     owned_titles = await db.get_user_titles(user.id)
