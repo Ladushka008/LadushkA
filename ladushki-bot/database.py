@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 import aiosqlite
 from config import Config
+from github_storage import upload_database
 
 
 async def init_db() -> None:
@@ -44,6 +45,7 @@ async def init_db() -> None:
         """)
         
         await db.commit()
+        await upload_database()
 
 
 async def ensure_user(user_id: int, username: Optional[str], full_name: str) -> None:
@@ -58,6 +60,7 @@ async def ensure_user(user_id: int, username: Optional[str], full_name: str) -> 
                 full_name = excluded.full_name;
         """, (user_id, username, full_name, now_str))
         await db.commit()
+        await upload_database()
 
 
 async def get_user_data(user_id: int) -> Optional[Tuple[int, Optional[str], str, int, Optional[str], str, int]]:
@@ -89,6 +92,8 @@ async def update_balance(user_id: int, delta: int) -> int:
             (delta, user_id)
         )
         await db.commit()
+        await upload_database()
+        
         async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else 0
@@ -100,6 +105,7 @@ async def set_balance(user_id: int, new_balance: int) -> int:
     async with aiosqlite.connect(Config.DB_FILE) as db:
         await db.execute("UPDATE users SET balance = ? WHERE user_id = ?", (target_bal, user_id))
         await db.commit()
+        await upload_database()
         return target_bal
 
 
@@ -129,6 +135,7 @@ async def claim_daily_bonus(user_id: int) -> Tuple[bool, int, Optional[timedelta
                 (reward, now.isoformat(), user_id)
             )
             await db.commit()
+            await upload_database()
             return True, reward, None
 
 
@@ -155,6 +162,7 @@ async def transfer_balance(sender_id: int, receiver_id: int, amount: int) -> boo
                 (sender_id, receiver_id, amount, now_str)
             )
             await db.commit()
+            await upload_database()
             return True
         except Exception:
             await db.execute("ROLLBACK;")
@@ -185,6 +193,7 @@ async def buy_item(user_id: int, item_name: str, price: int) -> bool:
                 (user_id, price, item_name, now_str)
             )
             await db.commit()
+            await upload_database()
             return True
         except Exception:
             await db.execute("ROLLBACK;")
@@ -206,6 +215,7 @@ async def use_item(user_id: int, item_name: str) -> bool:
         """, (user_id, item_name))
         await db.execute("DELETE FROM inventory WHERE user_id = ? AND item_name = ? AND quantity <= 0", (user_id, item_name))
         await db.commit()
+        await upload_database()
         return True
 
 
@@ -243,6 +253,7 @@ async def change_reputation(user_id: int, delta: int) -> Tuple[bool, int]:
 
         await db.execute("UPDATE users SET reputation = ? WHERE user_id = ?", (new_rep, user_id))
         await db.commit()
+        await upload_database()
         return True, new_rep
 
 
@@ -303,6 +314,7 @@ async def execute_rat_steal(thief_id: int, victim_id: int, amount: int) -> int:
                     (victim_id, thief_id, stolen, now_str)
                 )
             await db.commit()
+            await upload_database()
             return stolen
         except Exception:
             await db.execute("ROLLBACK;")
@@ -335,6 +347,7 @@ async def add_history_entry(sender: int, receiver: int, amount: int, action: str
             (sender, receiver, amount, action, reason, now_str)
         )
         await db.commit()
+        await upload_database()
 
 
 async def get_user_history(user_id: int) -> List[Tuple[str, int, str]]:
