@@ -10,6 +10,7 @@ import aiohttp
 import zoneinfo
 import random
 import threading
+import logging
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
@@ -20,13 +21,20 @@ from aiogram.client.default import DefaultBotProperties
 from aiohttp import web
 
 # ==========================
-# НАСТРОЙКИ
+# НАСТРОЙКА ЛОГИРОВАНИЯ
 # ==========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()]
+)
 
+# ==========================
+# КОНФИГУРАЦИЯ
+# ==========================
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7837011810"))
 PORT = int(os.getenv("PORT", 8080))
-
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID", "@ladushka09")
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
@@ -51,15 +59,36 @@ db_lock = threading.Lock()
 sync_event = asyncio.Event()
 is_db_dirty = False
 
+# ==========================================
+# СИСТЕМА ДИАГНОСТИКИ И ТРЕКИНГА БАЛАНСОВ
+# ==========================================
 
-# ==========================
-# GITHUB СИНХРОНИЗАЦИЯ
-# ==========================
+# Кэш известных балансов: {user_id: balance}
+KNOWN_BALANCES = {}
+
+# Флаги активности и вызовов событий
+EVENT_TRACKER = {
+    "sync_download_called": False,
+    "last_sync_download_time": "Никогда",
+    "sync_upload_called": False,
+    "last_sync_upload_time": "Никогда",
+    "sqlite_connect_called": False,
+    "last_sqlite_connect_time": "Никогда"
+}
+
+# Информация о последнем обращении к БД
+LAST_DB_ACTION = {
+    "function": "None",
+    "timestamp": "None",
+    "user_id": None,
+    "details": ""
+}
+
 
 def get_file_hash(filepath: str) -> str:
-    """Вычисляет SHA256 хеш файла для надежной проверки файлов"""
+    """Вычисляет SHA256 хеш файла database.db"""
     if not os.path.exists(filepath):
-        return ""
+        return "FILE_NOT_FOUND"
     hasher = hashlib.sha256()
     with open(filepath, "rb") as f:
         while chunk := f.read(8192):
@@ -67,18 +96,147 @@ def get_file_hash(filepath: str) -> str:
     return hasher.hexdigest()
 
 
+def track_sqlite_connect():
+    """Фиксирует подключение к базы через sqlite3.connect"""
+    EVENT_TRACKER["sqlite_connect_called"] = True
+    EVENT_TRACKER["last_sqlite_connect_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def log_db_commit(caller_name: str):
+    """Выполняет commit() с фиксированием имени выгрузившей функции и SHA256"""
+    global LAST_DB_ACTION
+    if db:
+        db.commit()
+        db_hash = get_file_hash(DB_FILE)
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        LAST_DB_ACTION["function"] = caller_name
+        LAST_DB_ACTION["timestamp"] = now_str
+        logging.info(f"💾 [COMMIT] Вызван из: {caller_name} в {now_str} | SHA256: {db_hash[:12]}")
+
+
+def change_user_balance(user_id: int, new_balance: int, caller_function: str, reason: str = "") -> int:
+    """
+    Единая точка изменения баланса.
+    Перехватывает изменение, логирует (функцию, user_id, ДО, ПОСЛЕ, время),
+    выполняет commit, обновляет локальный кэш и создает таймер проверки через 10 минут.
+    """
+    global KNOWN_BALANCES
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    with db_lock:
+        cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+        row = cursor.fetchone()
+        old_balance = row[0] if row else 0
+
+        # Прямое принудительное обновление
+        cursor.execute("UPDATE users SET balance = ? WHERE user_id=?", (new_balance, user_id))
+        log_db_commit(caller_function)
+
+        # Обновляем локальный кэш
+        KNOWN_BALANCES[user_id] = new_balance
+
+    db_hash = get_file_hash(DB_FILE)
+    logging.info(
+        f"\n📝 [BALANCE_UPDATE_LOG]\n"
+        f"├─ Название функции: {caller_function}\n"
+        f"├─ User ID: {user_id}\n"
+        f"├─ Баланс ДО: {old_balance}\n"
+        f"├─ Баланс ПОСЛЕ: {new_balance}\n"
+        f"├─ Точное время: {now_str}\n"
+        f"├─ Причина: {reason}\n"
+        f"└─ SHA256 DB: {db_hash[:12]}"
+    )
+
+    save_db_changes()
+    
+    # Запуск таймера проверки через 10 минут (600 сек)
+    asyncio.create_task(verify_balance_after_delay(user_id, new_balance, caller_function, delay=600))
+    return old_balance
+
+
+async def verify_balance_after_delay(user_id: int, expected_bal: int, original_caller: str, delay: int = 600):
+    """Проверяет баланс конкретного пользователя через 10 минут"""
+    await asyncio.sleep(delay)
+    current_bal = get_balance(user_id)
+    current_hash = get_file_hash(DB_FILE)
+
+    if current_bal != expected_bal:
+        logging.critical(
+            f"\n🚨 [ALERT! ОБНАРУЖЕН РАССИНХРОН БАЛАНСА ЧЕРЕЗ 10 МИНУТ!] 🚨\n"
+            f"├─ User ID: {user_id}\n"
+            f"├─ Ожидаемый баланс: {expected_bal}\n"
+            f"├─ Фактический баланс: {current_bal}\n"
+            f"├─ Исходная функция изменения (10 мин назад): {original_caller}\n"
+            f"├─ Последняя функция, вызвавшая commit(): {LAST_DB_ACTION['function']} (в {LAST_DB_ACTION['timestamp']})\n"
+            f"└─ SHA256 DB: {current_hash[:12]}"
+        )
+    else:
+        logging.info(
+            f"✅ [10-MIN VERIFY OK] Баланс User ID {user_id} через {delay // 60} мин корректен ({current_bal}). SHA256: {current_hash[:12]}"
+        )
+
+
+async def balance_checker_task():
+    """
+    Каждые 30 секунд автоматически проверяет баланс всех пользователей в базе.
+    Если баланс изменился без вызова функции — мгновенно выводится полная диагностика.
+    """
+    global KNOWN_BALANCES
+    logging.info("🔍 [MONITOR] Автоматический монитор балансов (30 сек) запущен.")
+
+    while True:
+        await asyncio.sleep(30)
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        with db_lock:
+            try:
+                cursor.execute("SELECT user_id, balance FROM users")
+                rows = cursor.fetchall()
+            except Exception as e:
+                logging.error(f"🔴 Ошибка чтения БД во время фоновой проверки: {e}")
+                continue
+
+        current_db_hash = get_file_hash(DB_FILE)
+
+        for user_id, current_bal in rows:
+            if user_id in KNOWN_BALANCES:
+                expected_bal = KNOWN_BALANCES[user_id]
+                if current_bal != expected_bal:
+                    # БАЛАНС ИЗМЕНИЛСЯ БЕЗ ВЫЗОВА ФУНКЦИИ ИЗМЕНЕНИЯ!
+                    logging.critical(
+                        f"\n🚨🚨🚨 [ALERT! САНКЦИОНИРОВАННЫЙ/ВНЕШНИЙ ОТКАТ БАЛАНСА!] 🚨🚨🚨\n"
+                        f"├─ User ID: {user_id}\n"
+                        f"├─ Старое значение (в кэше): {expected_bal}\n"
+                        f"├─ Новое значение (в БД): {current_bal}\n"
+                        f"├─ Точное время: {now_str}\n"
+                        f"├─ SHA256 файла database.db: {current_db_hash}\n"
+                        f"├─ Был ли вызван _sync_download: {EVENT_TRACKER['sync_download_called']} (в {EVENT_TRACKER['last_sync_download_time']})\n"
+                        f"├─ Был ли вызван _sync_upload_single: {EVENT_TRACKER['sync_upload_called']} (в {EVENT_TRACKER['last_sync_upload_time']})\n"
+                        f"├─ Был ли открыт новый sqlite3.connect: {EVENT_TRACKER['sqlite_connect_called']} (в {EVENT_TRACKER['last_sqlite_connect_time']})\n"
+                        f"└─ Последняя функция, коммитившая в БД: {LAST_DB_ACTION['function']} (в {LAST_DB_ACTION['timestamp']})"
+                    )
+            # Обновляем кэш, чтобы лог не дублировался каждую итерацию
+            KNOWN_BALANCES[user_id] = current_bal
+
+
+# ==========================
+# GITHUB СИНХРОНИЗАЦИЯ
+# ==========================
+
 def _sync_download():
-    """
-    Скачивает базу данных из GitHub ТОЛЬКО если локальный файл базы отсутствует.
-    """
+    """Скачивает базу из GitHub с подробным логированием"""
+    EVENT_TRACKER["sync_download_called"] = True
+    EVENT_TRACKER["last_sync_download_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     if not GITHUB_TOKEN or not GITHUB_REPO:
-        print("GitHub sync failed: missing token or repo")
+        logging.warning("⚠️ [_sync_download] GitHub Sync пропущен: не задан токен или репозиторий.")
         return False
 
     if os.path.exists(DB_FILE):
-        print("🟡 Локальная база данных уже существует. Скачивание с GitHub пропущено.")
+        logging.info(f"🟡 [_sync_download] База данных уже существует. SHA256: {get_file_hash(DB_FILE)[:12]}. Загрузка с GitHub отменена.")
         return True
 
+    logging.info("📥 [_sync_download] Файл database.db отсутствует. Начинаем загрузку с GitHub...")
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
     headers = {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -95,34 +253,42 @@ def _sync_download():
             with db_lock:
                 with open(DB_FILE, "wb") as f:
                     f.write(file_data)
-            print("🟢 Database successfully downloaded from GitHub!")
+
+            new_hash = get_file_hash(DB_FILE)
+            logging.info(f"🟢 [_sync_download] База успешно скачана с GitHub! SHA256: {new_hash[:12]}")
             return True
         else:
-            print(f"🔴 GitHub sync download failed: status {response.status_code}")
+            logging.error(f"🔴 [_sync_download] Ошибка скачивания с GitHub. Статус: {response.status_code}")
             return False
     except Exception as e:
-        print(f"🔴 GitHub sync download error: {e}")
+        logging.error(f"🔴 [_sync_download] Ошибка при выгрузке: {e}")
         return False
 
 
 def _sync_upload_single():
-    """Одиночная попытка загрузки с повторами при сбоях сети/конфликтах (Retry loop)"""
+    """Отправка локальной БД на GitHub с полным контролем хешей"""
+    EVENT_TRACKER["sync_upload_called"] = True
+    EVENT_TRACKER["last_sync_upload_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     if not GITHUB_TOKEN or not GITHUB_REPO:
         return False
 
     with db_lock:
         if not os.path.exists(DB_FILE):
+            logging.error("🔴 [_sync_upload_single] Отмена выгрузки: Файл database.db не существует.")
             return False
-        
-        # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: принудительный сброс всех транзакций из WAL-файла в database.db
+
         if db:
             try:
                 db.execute("PRAGMA wal_checkpoint(FULL);")
             except Exception as e:
-                print(f"⚠️ Ошибка вызова wal_checkpoint: {e}")
+                logging.warning(f"⚠️ [_sync_upload_single] Ошибка wal_checkpoint: {e}")
 
+        file_hash = get_file_hash(DB_FILE)
         with open(DB_FILE, "rb") as f:
             content_bytes = f.read()
+
+    logging.info(f"📤 [_sync_upload_single] Выгрузка базы на GitHub... SHA256: {file_hash[:12]}")
 
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
     headers = {
@@ -135,13 +301,13 @@ def _sync_upload_single():
         try:
             content_b64 = base64.b64encode(content_bytes).decode("utf-8")
             sha = None
-            
+
             get_resp = requests.get(url, headers=headers, params={"ref": BRANCH}, timeout=10)
             if get_resp.status_code == 200:
                 sha = get_resp.json().get("sha")
 
             data = {
-                "message": f"Auto-update database.db [{datetime.now().strftime('%H:%M:%S')}]",
+                "message": f"Auto-update database.db [{datetime.now().strftime('%H:%M:%S')}] SHA256: {file_hash[:8]}",
                 "content": content_b64,
                 "branch": BRANCH
             }
@@ -150,12 +316,12 @@ def _sync_upload_single():
 
             put_resp = requests.put(url, headers=headers, json=data, timeout=15)
             if put_resp.status_code in [200, 201]:
-                print("🟢 Database uploaded to GitHub successfully!")
+                logging.info(f"🟢 [_sync_upload_single] Файл отправлен на GitHub! SHA256: {file_hash[:12]}")
                 return True
             else:
-                print(f"⚠️ GitHub sync upload status {put_resp.status_code} (попытка {attempt}/{max_retries})")
+                logging.warning(f"⚠️ [_sync_upload_single] Статус ответа GitHub: {put_resp.status_code} (попытка {attempt}/{max_retries})")
         except Exception as e:
-            print(f"⚠️ GitHub sync upload error: {e} (попытка {attempt}/{max_retries})")
+            logging.error(f"⚠️ [_sync_upload_single] Ошибка отправки: {e} (попытка {attempt}/{max_retries})")
 
         import time
         time.sleep(2 * attempt)
@@ -164,7 +330,7 @@ def _sync_upload_single():
 
 
 async def _github_sync_worker():
-    """Фоновый воркер: мгновенно выгружает изменения на GitHub"""
+    """Фоновый воркер отправки изменений на GitHub"""
     global is_db_dirty
     while True:
         await sync_event.wait()
@@ -179,18 +345,17 @@ async def _github_sync_worker():
 
 
 def save_db_changes():
-    """Планирует моментальную выгрузку изменений в GitHub через воркер"""
+    """Планирует моментальную выгрузку на GitHub"""
     global is_db_dirty
     is_db_dirty = True
     sync_event.set()
 
 
 # ==========================
-# БЕКАПЫ И ПРОВЕРКА ЦЕЛОСТНОСТИ
+# БЭКАПЫ И ИНИЦИАЛИЗАЦИЯ
 # ==========================
 
 def create_backup():
-    """Создаёт резервную копию базы данных и удаляет старые (>20)"""
     if not os.path.exists(BACKUP_DIR):
         os.makedirs(BACKUP_DIR, exist_ok=True)
 
@@ -203,9 +368,9 @@ def create_backup():
                 bck = sqlite3.connect(backup_file)
                 db.backup(bck)
                 bck.close()
-                print(f"🟢 Резервная копия создана: {backup_file}")
+                logging.info(f"🟢 Резервная копия создана: {backup_file}")
             except Exception as e:
-                print(f"🔴 Ошибка при создании бэкапа SQLite: {e}")
+                logging.error(f"🔴 Ошибка бэкапа SQLite: {e}")
                 return
 
     backups = sorted(glob.glob(os.path.join(BACKUP_DIR, "backup_*.db")), key=os.path.getmtime)
@@ -213,15 +378,14 @@ def create_backup():
         oldest = backups.pop(0)
         try:
             os.remove(oldest)
-            print(f"🧹 Удалена старая резервная копия: {oldest}")
+            logging.info(f"🧹 Удален старый бэкап: {oldest}")
         except Exception as e:
-            print(f"🔴 Ошибка при удалении бэкапа {oldest}: {e}")
+            logging.error(f"🔴 Ошибка удаления бэкапа {oldest}: {e}")
 
 
 def check_and_restore_db():
-    """Проверяет целостность БД. Восстанавливает только если файл повреждён."""
     if not os.path.exists(DB_FILE):
-        print("ℹ️ Файл базы данных не найден. Будет создана новая БД.")
+        logging.info("ℹ️ Файл базы данных не найден на диске.")
         return
 
     is_corrupt = False
@@ -232,11 +396,11 @@ def check_and_restore_db():
         if not res or res[0] != "ok":
             is_corrupt = True
     except Exception as e:
-        print(f"🔴 Ошибка чтения БД: {e}")
+        logging.error(f"🔴 Ошибка проверки SQLite: {e}")
         is_corrupt = True
 
     if is_corrupt:
-        print("⚠️ Обнаружено повреждение базы данных! Запуск автовосстановления...")
+        logging.critical("⚠️ Обнаружено повреждение базы данных! Восстановление из бэкапов...")
         backups = sorted(glob.glob(os.path.join(BACKUP_DIR, "backup_*.db")), key=os.path.getmtime, reverse=True)
         restored = False
         for bck in backups:
@@ -246,26 +410,23 @@ def check_and_restore_db():
                 test_conn.close()
                 if res and res[0] == "ok":
                     shutil.copy(bck, DB_FILE)
-                    print(f"🟢 База данных успешно восстановлена из бэкапа: {bck}")
+                    logging.info(f"🟢 База успешно восстановлена из бэкапа: {bck}")
                     restored = True
                     break
             except Exception:
                 continue
         if not restored:
-            print("🔴 Не удалось найти исправный бэкап. Создаётся чистая база данных.")
+            logging.error("🔴 Исправный бэкап не найден.")
             if os.path.exists(DB_FILE):
                 os.remove(DB_FILE)
 
-
-# ==========================
-# ИНИЦИАЛИЗАЦИЯ И РАБОТА С БД
-# ==========================
 
 async def init_db():
     global db, cursor
     await asyncio.to_thread(check_and_restore_db)
     await asyncio.to_thread(_sync_download)
 
+    track_sqlite_connect()
     db = sqlite3.connect(DB_FILE, check_same_thread=False)
     cursor = db.cursor()
 
@@ -313,28 +474,29 @@ async def init_db():
                 PRIMARY KEY (user_id, item_name)
             )
             """)
-            db.commit()
+            log_db_commit("init_db")
+
+            # Первоначальное заполнение кэша известных балансов
+            cursor.execute("SELECT user_id, balance FROM users")
+            for u_id, bal in cursor.fetchall():
+                KNOWN_BALANCES[u_id] = bal
+
         except Exception as e:
             db.rollback()
-            print(f"🔴 Ошибка при инициализации таблиц: {e}")
+            logging.error(f"🔴 Ошибка при инициализации таблиц: {e}")
 
 
 # ==========================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ПРОВЕРКИ
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==========================
 
 def is_user_registered(user_id: int) -> bool:
-    """Проверяет, существует ли пользователь в базе данных исключительно по user_id."""
     with db_lock:
         cursor.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,))
         return cursor.fetchone() is not None
 
 
 def ensure_user_registered(user):
-    """
-    Гарантирует регистрацию или обновление данных профиля.
-    Если пользователь существует — сохраняется текущий баланс и обновляются только username/full_name.
-    """
     if not user or user.is_bot:
         return
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -350,19 +512,19 @@ def ensure_user_registered(user):
                 """,
                 (user.id, user.username, user.full_name, now_str)
             )
-            db.commit()
+            log_db_commit("ensure_user_registered")
+            if user.id not in KNOWN_BALANCES:
+                KNOWN_BALANCES[user.id] = 0
         except Exception as e:
             db.rollback()
-            print(f"Ошибка гарантированной регистрации пользователя: {e}")
+            logging.error(f"Ошибка регистрации пользователя: {e}")
 
 
 def register_user(user):
-    """Регистрирует пользователя безопасным образом без риска затирания баланса."""
     ensure_user_registered(user)
 
 
 def get_balance(user_id: int) -> int:
-    """Получает единый баланс строго по user_id."""
     with db_lock:
         cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
         row = cursor.fetchone()
@@ -379,10 +541,7 @@ def get_reputation(user_id: int) -> int:
 def get_user_mention(user):
     if not user:
         return "Неизвестный"
-    if user.username:
-        url = f"https://t.me/{user.username}"
-    else:
-        url = f"tg://user?id={user.id}"
+    url = f"https://t.me/{user.username}" if user.username else f"tg://user?id={user.id}"
     return f'<a href="{url}">{user.full_name}</a>'
 
 
@@ -401,19 +560,12 @@ def add_history(sender, receiver, amount, action, reason=""):
                 INSERT INTO history(sender, receiver, amount, action, reason, date)
                 VALUES(?,?,?,?,?,?)
                 """,
-                (
-                    sender,
-                    receiver,
-                    amount,
-                    action,
-                    reason,
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                )
+                (sender, receiver, amount, action, reason, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             )
-            db.commit()
+            log_db_commit("add_history")
         except Exception as e:
             db.rollback()
-            print(f"Ошибка логирования истории: {e}")
+            logging.error(f"Ошибка логирования истории: {e}")
             return
     save_db_changes()
 
@@ -437,10 +589,10 @@ def add_item(user_id, item_name, count=1):
                 VALUES (?, ?, ?)
                 ON CONFLICT(user_id, item_name) DO UPDATE SET quantity = quantity + ?
             """, (user_id, item_name, count, count))
-            db.commit()
+            log_db_commit("add_item")
         except Exception as e:
             db.rollback()
-            print(f"Ошибка добавления предмета: {e}")
+            logging.error(f"Ошибка добавления предмета: {e}")
             return
     save_db_changes()
 
@@ -456,10 +608,10 @@ def remove_item(user_id, item_name, count=1):
                 cursor.execute("DELETE FROM inventory WHERE user_id=? AND item_name=?", (user_id, item_name))
             else:
                 cursor.execute("UPDATE inventory SET quantity = quantity - ? WHERE user_id=? AND item_name=?", (count, user_id, item_name))
-            db.commit()
+            log_db_commit("remove_item")
         except Exception as e:
             db.rollback()
-            print(f"Ошибка удаления предмета: {e}")
+            logging.error(f"Ошибка удаления предмета: {e}")
             return
     save_db_changes()
 
@@ -525,46 +677,27 @@ async def basketball_game(message: Message):
 
     if score >= 4:
         reward = int(amount * 0.3)
-        with db_lock:
-            try:
-                cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (reward, user.id))
-                db.commit()
-            except Exception as e:
-                db.rollback()
-                print(f"Ошибка при зачислении наград в баскетболе: {e}")
-                return
+        new_bal = current_balance + reward
+        change_user_balance(user.id, new_bal, "basketball_game_win", f"Выигрыш в баскетбол +{reward}")
 
-        save_db_changes()
         add_history(0, user.id, reward, "basketball_win")
-        new_balance = get_balance(user.id)
-
         await message.reply(
             f"🏀 <b>ТОЧНЫЙ БРОСОК!</b>\n\n"
             f"🎉 Попадание в корзину!\n"
             f"💰 Вы получили: <b>+{reward}</b> ладушек 👏\n"
-            f"🪙 Ваш баланс: <b>{new_balance}</b>"
+            f"🪙 Ваш баланс: <b>{new_bal}</b>"
         )
     else:
         loss = amount
+        new_bal = max(0, current_balance - loss)
+        change_user_balance(user.id, new_bal, "basketball_game_loss", f"Проигрыш в баскетбол -{loss}")
 
-        with db_lock:
-            try:
-                cursor.execute("UPDATE users SET balance = MAX(balance - ?, 0) WHERE user_id=?", (loss, user.id))
-                db.commit()
-            except Exception as e:
-                db.rollback()
-                print(f"Ошибка при списании баланса в баскетболе: {e}")
-                return
-
-        save_db_changes()
         add_history(user.id, 0, loss, "basketball_loss")
-        new_balance = get_balance(user.id)
-
         await message.reply(
             f"🏀 Бросок…\n"
             f"😔 Промах!\n"
             f"💸 Потеряно: <b>{loss}</b> ладушек.\n"
-            f"🪙 Текущий баланс: <b>{new_balance}</b> ладушек."
+            f"🪙 Текущий баланс: <b>{new_bal}</b> ладушек."
         )
 
 
@@ -585,7 +718,6 @@ async def profile_handler(message: Message):
         f"🎒 <b>Предметов:</b> {items_count}\n\n"
         f"⭐ <b>Репутация:</b> {user_rep}/10"
     )
-
     await message.answer(text, disable_web_page_preview=True)
 
 
@@ -605,7 +737,6 @@ async def balance(message: Message):
         f"┌ 👤 <b>Профиль:</b> {user_link}\n"
         f"└ 🪙 <b>Баланс:</b> {user_balance} ладушек"
     )
-
     await message.answer(text, disable_web_page_preview=True)
 
 
@@ -617,9 +748,10 @@ async def get_daily_bonus(message: Message):
     now = datetime.now()
 
     with db_lock:
-        cursor.execute("SELECT last_bonus FROM users WHERE user_id=?", (user.id,))
+        cursor.execute("SELECT last_bonus, balance FROM users WHERE user_id=?", (user.id,))
         row = cursor.fetchone()
         last_bonus_str = row[0] if row else None
+        current_bal = row[1] if row else 0
 
         if last_bonus_str:
             last_bonus_time = datetime.fromisoformat(last_bonus_str)
@@ -636,19 +768,17 @@ async def get_daily_bonus(message: Message):
                 return
 
         reward = random.randint(1, 5)
+        new_bal = current_bal + reward
 
         try:
-            cursor.execute(
-                "UPDATE users SET balance = balance + ?, last_bonus = ? WHERE user_id=?",
-                (reward, now.isoformat(), user.id)
-            )
-            db.commit()
+            cursor.execute("UPDATE users SET last_bonus = ? WHERE user_id=?", (now.isoformat(), user.id))
+            log_db_commit("get_daily_bonus_time_update")
         except Exception as e:
             db.rollback()
-            print(f"Ошибка получения бонуса: {e}")
+            logging.error(f"Ошибка сохранения даты бонуса: {e}")
             return
 
-    save_db_changes()
+    change_user_balance(user.id, new_bal, "get_daily_bonus", f"Ежедневный бонус +{reward}")
     add_history(0, user.id, reward, "daily_bonus")
 
     await message.reply(
@@ -678,25 +808,16 @@ async def shop_handler(message: Message):
 async def buy_battle_ladushka(message: Message):
     user = message.from_user
     ensure_user_registered(user)
-    
     price = 200
+    current_bal = get_balance(user.id)
+
+    if current_bal < price:
+        await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{current_bal}</b> ладушек")
+        return
+
+    new_bal = current_bal - price
+    change_user_balance(user.id, new_bal, "buy_battle_ladushka", f"Покупка Боевая ладушка за {price}")
     
-    with db_lock:
-        try:
-            cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (price, user.id, price))
-            if cursor.rowcount == 0:
-                cursor.execute("SELECT balance FROM users WHERE user_id=?", (user.id,))
-                row = cursor.fetchone()
-                user_bal = row[0] if row else 0
-                await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{user_bal}</b> ладушек")
-                return
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            print(f"Ошибка покупки: {e}")
-            return
-    
-    save_db_changes()
     add_item(user.id, "battle_ladushka", 1)
     add_history(user.id, 0, price, "buy_item", "Боевая ладушка")
 
@@ -711,25 +832,16 @@ async def buy_battle_ladushka(message: Message):
 async def buy_tomato(message: Message):
     user = message.from_user
     ensure_user_registered(user)
-    
     price = 100
+    current_bal = get_balance(user.id)
 
-    with db_lock:
-        try:
-            cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (price, user.id, price))
-            if cursor.rowcount == 0:
-                cursor.execute("SELECT balance FROM users WHERE user_id=?", (user.id,))
-                row = cursor.fetchone()
-                user_bal = row[0] if row else 0
-                await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{user_bal}</b> ладушек")
-                return
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            print(f"Ошибка покупки: {e}")
-            return
-    
-    save_db_changes()
+    if current_bal < price:
+        await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{current_bal}</b> ладушек")
+        return
+
+    new_bal = current_bal - price
+    change_user_balance(user.id, new_bal, "buy_tomato", f"Покупка Томата за {price}")
+
     add_item(user.id, "tomato", 1)
     add_history(user.id, 0, price, "buy_item", "Томат")
 
@@ -744,25 +856,16 @@ async def buy_tomato(message: Message):
 async def buy_rat(message: Message):
     user = message.from_user
     ensure_user_registered(user)
-    
     price = 250
+    current_bal = get_balance(user.id)
 
-    with db_lock:
-        try:
-            cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (price, user.id, price))
-            if cursor.rowcount == 0:
-                cursor.execute("SELECT balance FROM users WHERE user_id=?", (user.id,))
-                row = cursor.fetchone()
-                user_bal = row[0] if row else 0
-                await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{user_bal}</b> ладушек")
-                return
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            print(f"Ошибка покупки: {e}")
-            return
-    
-    save_db_changes()
+    if current_bal < price:
+        await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{current_bal}</b> ладушек")
+        return
+
+    new_bal = current_bal - price
+    change_user_balance(user.id, new_bal, "buy_rat", f"Покупка Крысы за {price}")
+
     add_item(user.id, "rat", 1)
     add_history(user.id, 0, price, "buy_item", "Крыса")
 
@@ -827,9 +930,7 @@ async def hit_with_ladushka(message: Message):
         f"💥 {sender_link} размахнулся и влепил ладушку {receiver_link}!",
         f"🏛 <b>Министр Ладушек одобрил удар.</b>\n\n🥊 {sender_link} ударил {receiver_link} ладушкой!"
     ]
-
-    selected_phrase = random.choice(phrases)
-    await message.reply(selected_phrase, disable_web_page_preview=True)
+    await message.reply(random.choice(phrases), disable_web_page_preview=True)
 
 
 @dp.message(F.text.lower() == "кинуть томат")
@@ -859,9 +960,7 @@ async def throw_tomato(message: Message):
         f"🍅 {sender_link} запустил томат в {receiver_link}!\n\n💥 Прямое попадание!\n\n😂 {receiver_link} весь в кетчупе.",
         f"🎯 <b>Меткий бросок!</b>\n\n🍅 {receiver_link} теперь весь в томатном соке."
     ]
-
-    selected_phrase = random.choice(phrases)
-    await message.reply(selected_phrase, disable_web_page_preview=True)
+    await message.reply(random.choice(phrases), disable_web_page_preview=True)
 
 
 @dp.message(F.text.lower() == "крыса")
@@ -889,43 +988,22 @@ async def use_rat(message: Message):
 
     if target_bal <= 0:
         await message.reply(f"🐀 Крыса обыскала карманы {target_name}...\n\n😢 Но там не оказалось ни одной ладушки.")
-    elif target_bal < wanted_steal:
-        stolen = target_bal
-        with db_lock:
-            try:
-                cursor.execute("UPDATE users SET balance = 0 WHERE user_id=?", (target_id,))
-                cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (stolen, sender.id))
-                db.commit()
-            except Exception as e:
-                db.rollback()
-                print(f"Ошибка кражи: {e}")
-                return
-        save_db_changes()
-        add_history(target_id, sender.id, stolen, "rat_steal")
-
-        await message.reply(
-            f"🐀 Крыса пробралась к {target_name}!\n\n"
-            f"💸 У {target_name} было только {target_bal} ладушки.\n"
-            f"Крыса украла всё что смогла: {stolen} ладушки."
-        )
     else:
-        stolen = wanted_steal
-        with db_lock:
-            try:
-                cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (stolen, target_id))
-                cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (stolen, sender.id))
-                db.commit()
-            except Exception as e:
-                db.rollback()
-                print(f"Ошибка кражи: {e}")
-                return
-        save_db_changes()
+        stolen = min(target_bal, wanted_steal)
+        
+        target_new_bal = target_bal - stolen
+        sender_old_bal = get_balance(sender.id)
+        sender_new_bal = sender_old_bal + stolen
+
+        change_user_balance(target_id, target_new_bal, "use_rat_victim", f"Кража крысой (-{stolen})")
+        change_user_balance(sender.id, sender_new_bal, "use_rat_thief", f"Кража крысой (+{stolen})")
+
         add_history(target_id, sender.id, stolen, "rat_steal")
 
         await message.reply(f"🐀 Крыса пробралась к {target_name}!\n\n💸 Украдено: {stolen} ладушки")
 
 
-# --- ДЕНЕЖНЫЕ ПЕРЕВОДЫ И ПОДАРКИ (ЛАДОШКИ) ---
+# --- ДЕНЕЖНЫЕ ПЕРЕВОДЫ И ПОДАРКИ ---
 
 @dp.message(F.text.lower().startswith("дать "))
 async def transfer_custom_amount(message: Message):
@@ -953,28 +1031,20 @@ async def transfer_custom_amount(message: Message):
         await message.reply("❌ Нельзя переводить ладушки самому себе.")
         return
 
-    with db_lock:
-        try:
-            cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (amount, sender.id, amount))
-            if cursor.rowcount == 0:
-                cursor.execute("SELECT balance FROM users WHERE user_id=?", (sender.id,))
-                row = cursor.fetchone()
-                sender_balance = row[0] if row else 0
-                await message.reply(f"❌ <b>Недостаточно средств!</b>\nУ вас на балансе: <b>{sender_balance}</b> ладушек.")
-                return
+    sender_bal = get_balance(sender.id)
+    if sender_bal < amount:
+        await message.reply(f"❌ <b>Недостаточно средств!</b>\nУ вас на балансе: <b>{sender_bal}</b> ладушек.")
+        return
 
-            cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, receiver.id))
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            print(f"Ошибка перевода: {e}")
-            return
+    receiver_bal = get_balance(receiver.id)
 
-    save_db_changes()
+    sender_new_bal = sender_bal - amount
+    receiver_new_bal = receiver_bal + amount
+
+    change_user_balance(sender.id, sender_new_bal, "transfer_custom_amount_sender", f"Перевод {amount} -> {receiver.id}")
+    change_user_balance(receiver.id, receiver_new_bal, "transfer_custom_amount_receiver", f"Перевод {amount} <- {sender.id}")
+
     add_history(sender.id, receiver.id, amount, "transfer")
-
-    sender_new_bal = get_balance(sender.id)
-    receiver_new_bal = get_balance(receiver.id)
 
     sender_mention = get_user_mention(sender)
     receiver_mention = get_user_mention(receiver)
@@ -1000,7 +1070,6 @@ async def transfer_one_ladushka(message: Message):
         return
 
     receiver = message.reply_to_message.from_user
-
     if receiver.is_bot:
         await message.reply("🤖 Нельзя передавать ладушки боту.")
         return
@@ -1011,21 +1080,16 @@ async def transfer_one_ladushka(message: Message):
         await message.reply("❌ Нельзя дарить ладушки самому себе.")
         return
 
-    with db_lock:
-        try:
-            cursor.execute("UPDATE users SET balance = balance - 1 WHERE user_id=? AND balance >= 1", (sender.id,))
-            if cursor.rowcount == 0:
-                await message.reply("❌ У вас нет ладушек.")
-                return
+    sender_bal = get_balance(sender.id)
+    if sender_bal < 1:
+        await message.reply("❌ У вас нет ладушек.")
+        return
 
-            cursor.execute("UPDATE users SET balance = balance + 1 WHERE user_id=?", (receiver.id,))
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            print(f"Ошибка передачи ладушки: {e}")
-            return
+    receiver_bal = get_balance(receiver.id)
 
-    save_db_changes()
+    change_user_balance(sender.id, sender_bal - 1, "transfer_one_ladushka_sender", "Подарок 1 ладушка")
+    change_user_balance(receiver.id, receiver_bal + 1, "transfer_one_ladushka_receiver", "Подарок 1 ладушка")
+
     add_history(sender.id, receiver.id, 1, "transfer")
 
     sender_mention = get_user_mention(sender)
@@ -1095,17 +1159,11 @@ async def history(message: Message):
 
 @dp.message(F.text.lower() == "+реп")
 async def add_reputation(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-
-    if not message.reply_to_message or not message.reply_to_message.from_user:
-        await message.reply("❌ Ответьте на сообщение пользователя.")
+    if not is_admin(message.from_user.id) or not message.reply_to_message or not message.reply_to_message.from_user:
         return
 
     target = message.reply_to_message.from_user
-
     if target.is_bot:
-        await message.reply("🤖 Боту нельзя выдавать репутацию.")
         return
 
     ensure_user_registered(target)
@@ -1122,34 +1180,23 @@ async def add_reputation(message: Message):
         new_rep = current_rep + 1
         try:
             cursor.execute("UPDATE users SET reputation=? WHERE user_id=?", (new_rep, target.id))
-            db.commit()
+            log_db_commit("add_reputation")
         except Exception as e:
             db.rollback()
-            print(f"Ошибка репутации: {e}")
+            logging.error(f"Ошибка репутации: {e}")
             return
 
     save_db_changes()
-
-    await message.reply(
-        f"⭐ <b>Репутация выдана!</b>\n\n"
-        f"👤 <b>Игрок:</b> {target.full_name}\n"
-        f"➕ <b>Репутация:</b> +1"
-    )
+    await message.reply(f"⭐ <b>Репутация выдана!</b>\n\n👤 <b>Игрок:</b> {target.full_name}\n➕ <b>Репутация:</b> +1")
 
 
 @dp.message(F.text.lower() == "-реп")
 async def remove_reputation(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-
-    if not message.reply_to_message or not message.reply_to_message.from_user:
-        await message.reply("❌ Ответьте на сообщение пользователя.")
+    if not is_admin(message.from_user.id) or not message.reply_to_message or not message.reply_to_message.from_user:
         return
 
     target = message.reply_to_message.from_user
-
     if target.is_bot:
-        await message.reply("🤖 Боту нельзя выдавать репутацию.")
         return
 
     ensure_user_registered(target)
@@ -1166,19 +1213,14 @@ async def remove_reputation(message: Message):
         new_rep = current_rep - 1
         try:
             cursor.execute("UPDATE users SET reputation=? WHERE user_id=?", (new_rep, target.id))
-            db.commit()
+            log_db_commit("remove_reputation")
         except Exception as e:
             db.rollback()
-            print(f"Ошибка репутации: {e}")
+            logging.error(f"Ошибка репутации: {e}")
             return
 
     save_db_changes()
-
-    await message.reply(
-        f"⭐ <b>Репутация изменена!</b>\n\n"
-        f"👤 <b>Игрок:</b> {target.full_name}\n"
-        f"➖ <b>Репутация:</b> -1"
-    )
+    await message.reply(f"⭐ <b>Репутация изменена!</b>\n\n👤 <b>Игрок:</b> {target.full_name}\n➖ <b>Репутация:</b> -1")
 
 
 @dp.message(F.text.lower() == "репутация")
@@ -1198,7 +1240,6 @@ async def top_reputation_handler(message: Message):
 
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
     text = "⭐ <b>Топ по репутации</b>\n\n"
-
     for idx, (full_name, rep) in enumerate(rows):
         emoji = medals[idx] if idx < len(medals) else f"{idx + 1}️⃣"
         text += f"{emoji} {full_name} — {rep} репутации\n"
@@ -1206,7 +1247,7 @@ async def top_reputation_handler(message: Message):
     await message.answer(text)
 
 
-# --- АДМИНСКИЕ КОМАНДЫ И ШТРАФЫ ---
+# --- АДМИНСКИЕ КОМАНДЫ ---
 
 @dp.message(F.text.lower() == "база")
 async def show_users_database(message: Message):
@@ -1234,7 +1275,6 @@ async def show_users_database(message: Message):
         return
 
     text = f"📊 <b>База пользователей (показано {active_users} из {total_users}):</b>\n\n"
-
     for idx, (full_name, user_id, balance, reputation) in enumerate(rows, start=1):
         text += (
             f"👤 <b>Имя:</b> {full_name}\n"
@@ -1243,79 +1283,48 @@ async def show_users_database(message: Message):
             f"⭐ <b>Репутация:</b> {reputation}\n"
             "───────────────\n"
         )
-
     await message.answer(text)
 
 
 @dp.message(F.text.lower().startswith("штраф"))
 async def fine_handler(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-
-    if not message.reply_to_message or not message.reply_to_message.from_user:
-        await message.reply("❌ Ответьте на сообщение игрока.")
+    if not is_admin(message.from_user.id) or not message.reply_to_message or not message.reply_to_message.from_user:
         return
 
     target = message.reply_to_message.from_user
     if target.is_bot:
-        await message.reply("🤖 Бота нельзя штрафовать.")
         return
 
     ensure_user_registered(target)
 
     parts = message.text.split()
     if len(parts) < 2 or not parts[1].isdigit():
-        await message.reply("⚠️ Укажите сумму штрафа числом. Пример: <code>штраф 10</code>")
+        await message.reply("⚠️ Укажите сумму штрафа числом.")
         return
 
     fine_amount = int(parts[1])
+    current_bal = get_balance(target.id)
 
-    with db_lock:
-        cursor.execute("SELECT balance FROM users WHERE user_id=?", (target.id,))
-        row = cursor.fetchone()
-        current_bal = row[0] if row else 0
+    if current_bal <= 0:
+        await message.reply("🚔 Штраф не удалось взыскать: у игрока 0 ладушек.")
+        return
 
-        if current_bal <= 0:
-            await message.reply("🚔 Штраф не удалось взыскать.\n\n😅 У игрока нет ладушек для списания.")
-            return
+    if current_bal < fine_amount:
+        deducted = current_bal
+        new_bal = 0
+    else:
+        deducted = fine_amount
+        new_bal = current_bal - fine_amount
 
-        if current_bal < fine_amount:
-            deducted = current_bal
-            try:
-                cursor.execute("UPDATE users SET balance = 0 WHERE user_id=?", (target.id,))
-                db.commit()
-            except Exception as e:
-                db.rollback()
-                print(f"Ошибка списания штрафа: {e}")
-                return
-            save_db_changes()
-            add_history(ADMIN_ID, target.id, deducted, "fine")
+    change_user_balance(target.id, new_bal, "fine_handler", f"Админ выписал штраф {deducted}")
+    add_history(ADMIN_ID, target.id, deducted, "fine")
 
-            await message.reply(
-                f"🚔 Администратор выписал штраф.\n\n"
-                f"👤 Игрок: {target.full_name}\n"
-                f"💸 У игрока было только {current_bal} ладушек.\n\n"
-                f"Списано: {deducted} ладушек\n\n"
-                f"Баланс: 0 ладушек"
-            )
-        else:
-            new_bal = current_bal - fine_amount
-            try:
-                cursor.execute("UPDATE users SET balance = ? WHERE user_id=?", (new_bal, target.id))
-                db.commit()
-            except Exception as e:
-                db.rollback()
-                print(f"Ошибка списания штрафа: {e}")
-                return
-            save_db_changes()
-            add_history(ADMIN_ID, target.id, fine_amount, "fine")
-
-            await message.reply(
-                f"🚔 Администратор выписал штраф.\n\n"
-                f"👤 Игрок: {target.full_name}\n"
-                f"💸 Штраф: {fine_amount} ладушек\n\n"
-                f"Новый баланс: {new_bal} ладушек"
-            )
+    await message.reply(
+        f"🚔 Администратор выписал штраф.\n\n"
+        f"👤 Игрок: {target.full_name}\n"
+        f"💸 Списано: {deducted} ладушек\n"
+        f"Новый баланс: {new_bal} ладушек"
+    )
 
 
 @dp.message(Command("add"))
@@ -1327,26 +1336,17 @@ async def add_balance(message: Message):
     ensure_user_registered(user)
 
     args = message.text.split()
-    if len(args) != 2:
+    if len(args) != 2 or not args[1].isdigit():
         await message.answer("Использование: /add 10")
         return
-    try:
-        amount = int(args[1])
-    except ValueError:
-        await message.answer("Введите число.")
-        return
 
-    with db_lock:
-        try:
-            cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user.id))
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            print(f"Ошибка изменения баланса: {e}")
-            return
+    amount = int(args[1])
+    old_bal = get_balance(user.id)
+    new_bal = old_bal + amount
 
-    save_db_changes()
+    change_user_balance(user.id, new_bal, "add_balance", f"Начисление админом {amount}")
     add_history(ADMIN_ID, user.id, amount, "add")
+
     user_link = get_user_mention(user)
     await message.answer(f"✅ {user_link} получил {amount} ладушек.", disable_web_page_preview=True)
 
@@ -1360,25 +1360,17 @@ async def remove_balance(message: Message):
     ensure_user_registered(user)
 
     args = message.text.split()
-    if len(args) != 2:
-        return
-    try:
-        amount = int(args[1])
-    except ValueError:
+    if len(args) != 2 or not args[1].isdigit():
         return
 
-    with db_lock:
-        try:
-            cursor.execute("UPDATE users SET balance = MAX(balance-?,0) WHERE user_id=?", (amount, user.id))
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            print(f"Ошибка снятия баланса: {e}")
-            return
+    amount = int(args[1])
+    old_bal = get_balance(user.id)
+    new_bal = max(0, old_bal - amount)
 
-    save_db_changes()
+    change_user_balance(user.id, new_bal, "remove_balance", f"Списание админом {amount}")
     add_history(ADMIN_ID, user.id, amount, "remove")
-    await message.answer("✅ Ладушки сняты.")
+
+    await message.answer(f"✅ Ладушки сняты. Старый: {old_bal} -> Новый: {new_bal}")
 
 
 @dp.message(Command("set"))
@@ -1390,23 +1382,11 @@ async def set_balance(message: Message):
     ensure_user_registered(user)
 
     args = message.text.split()
-    if len(args) != 2:
-        return
-    try:
-        amount = int(args[1])
-    except ValueError:
+    if len(args) != 2 or not args[1].isdigit():
         return
 
-    with db_lock:
-        try:
-            cursor.execute("UPDATE users SET balance=? WHERE user_id=?", (amount, user.id))
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            print(f"Ошибка установки баланса: {e}")
-            return
-    save_db_changes()
-
+    amount = int(args[1])
+    change_user_balance(user.id, amount, "set_balance", f"Установка баланса админом: {amount}")
     await message.answer("✅ Баланс изменён.")
 
 
@@ -1419,24 +1399,16 @@ async def admin_bonus(message: Message):
     ensure_user_registered(user)
 
     args = message.text.split()
-    if len(args) < 2:
-        return
-    try:
-        amount = int(args[1])
-    except ValueError:
+    if len(args) < 2 or not args[1].isdigit():
         return
 
-    with db_lock:
-        try:
-            cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user.id))
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            print(f"Ошибка админ-бонуса: {e}")
-            return
-    
-    save_db_changes()
+    amount = int(args[1])
+    old_bal = get_balance(user.id)
+    new_bal = old_bal + amount
+
+    change_user_balance(user.id, new_bal, "admin_bonus", f"Бонус от админа {amount}")
     add_history(ADMIN_ID, user.id, amount, "admin_bonus")
+
     user_link = get_user_mention(user)
     await message.answer(f"🎁 Игрок {user_link} получил бонус {amount} ладушек.", disable_web_page_preview=True)
 
@@ -1449,16 +1421,7 @@ async def reset(message: Message):
     user = message.reply_to_message.from_user
     ensure_user_registered(user)
 
-    with db_lock:
-        try:
-            cursor.execute("UPDATE users SET balance=0 WHERE user_id=?", (user.id,))
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            print(f"Ошибка сброса: {e}")
-            return
-    save_db_changes()
-
+    change_user_balance(user.id, 0, "reset", "Сброс баланса админом в 0")
     await message.answer("♻️ Баланс игрока сброшен.")
 
 
@@ -1467,7 +1430,8 @@ async def reset(message: Message):
 # ==========================
 
 async def handle_ping(request):
-    return web.Response(text="Bot is running!")
+    return web.Response(text="Bot is running with balance diagnostics!")
+
 
 async def start_web_server():
     app = web.Application()
@@ -1476,7 +1440,7 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    print(f"Web server started on port {PORT}")
+    logging.info(f"Web server started on port {PORT}")
 
 
 async def auto_ping_task():
@@ -1490,13 +1454,11 @@ async def auto_ping_task():
                 try:
                     async with session.get(ping_url, timeout=10) as response:
                         if response.status == 200:
-                            print(f"[{datetime.now().strftime('%H:%M:%S')}] Auto-ping success: {ping_url}")
+                            logging.info(f"[{datetime.now().strftime('%H:%M:%S')}] Auto-ping success: {ping_url}")
                             success = True
                             break
-                        else:
-                            print(f"Auto-ping attempt {attempt} status: {response.status}")
                 except Exception as e:
-                    print(f"Auto-ping attempt {attempt} error: {e}")
+                    logging.warning(f"Auto-ping attempt {attempt} error: {e}")
                 
                 if not success and attempt == 1:
                     await asyncio.sleep(5)
@@ -1505,28 +1467,24 @@ async def auto_ping_task():
 
 
 async def auto_backup_task():
-    """Фоновая задача: каждые 30 минут делает резервную копию базы данных"""
     while True:
         await asyncio.sleep(1800)
         try:
             await asyncio.to_thread(create_backup)
         except Exception as e:
-            print(f"🔴 Ошибка во время выполнения автоматического бэкапа: {e}")
+            logging.error(f"🔴 Ошибка автоматического бэкапа: {e}")
 
 
 async def daily_ladushki_task():
     kyiv_tz = zoneinfo.ZoneInfo("Europe/Kyiv")
-    
     while True:
         now = datetime.now(kyiv_tz)
         target_time = now.replace(hour=19, minute=0, second=0, microsecond=0)
-        
         if now >= target_time:
             target_time += timedelta(days=1)
         
         wait_seconds = (target_time - now).total_seconds()
-        print(f"Следующая отправка 'Ладушек' запланирована на {target_time.strftime('%d.%m.%Y %H:%M:%S')} (через {int(wait_seconds)} сек)")
-        
+        logging.info(f"Следующая отправка 'Ладушек' запланирована на {target_time.strftime('%d.%m.%Y %H:%M:%S')}")
         await asyncio.sleep(wait_seconds)
         
         try:
@@ -1535,53 +1493,58 @@ async def daily_ladushki_task():
                 "🎵 <i>Ладушки, ладушки, где были? У бабушки!</i> 🎵"
             )
             await bot.send_message(chat_id=GROUP_CHAT_ID, text=text)
-            print("Ежедневное сообщение 'Ладушки' успешно отправлено в группу!")
+            logging.info("Ежедневное сообщение 'Ладушки' отправлено!")
         except Exception as e:
-            print(f"Ошибка при отправке ежедневного сообщения: {e}")
+            logging.error(f"Ошибка ежедневного сообщения: {e}")
 
 
 async def cleanup_db_task():
-    """Очищает устаревшую временную историю операций"""
     while True:
         try:
             with db_lock:
                 cursor.execute("DELETE FROM inventory WHERE quantity <= 0")
                 cutoff_date = (datetime.now() - timedelta(days=14)).strftime("%Y-%m-%d %H:%M:%S")
                 cursor.execute("DELETE FROM history WHERE date < ?", (cutoff_date,))
-                db.commit()
-            print("🧹 Очистка временных данных в базе завершена.")
+                log_db_commit("cleanup_db_task")
+            logging.info("🧹 Очистка устаревших данных завершена.")
             save_db_changes()
         except Exception as e:
             if db:
                 db.rollback()
-            print(f"Ошибка при автоматической очистке БД: {e}")
-
+            logging.error(f"Ошибка при автоочистке БД: {e}")
         await asyncio.sleep(86400)
 
 
 async def on_shutdown():
-    """Гарантирует загрузку последних изменений на GitHub при остановке/перезапуске бота"""
     global is_db_dirty
     if is_db_dirty:
-        print("⏳ Загружаем последние локальные изменения в GitHub перед выключением...")
+        logging.info("⏳ Загружаем последние изменения в GitHub перед остановкой...")
         await asyncio.to_thread(_sync_upload_single)
 
 
 async def main():
+    abs_db_path = os.path.abspath(DB_FILE)
+    logging.info(f"📍 [ENV_CHECK] Абсолютный путь к базе данных: {abs_db_path}")
+    logging.info(f"📍 [ENV_CHECK] Файл database.db существует до инициализации: {os.path.exists(DB_FILE)}")
+    if os.path.exists(DB_FILE):
+        logging.info(f"📍 [ENV_CHECK] Начальный SHA256 DB: {get_file_hash(DB_FILE)[:12]}")
+
     await init_db()
     await start_web_server()
     
     dp.shutdown.register(on_shutdown)
     await asyncio.to_thread(create_backup)
     
+    # Регистрация фоновых задач
     asyncio.create_task(_github_sync_worker())
+    asyncio.create_task(balance_checker_task())  # <--- Авто-проверка каждые 30 секунд
     asyncio.create_task(auto_ping_task())
     asyncio.create_task(auto_backup_task())
     asyncio.create_task(daily_ladushki_task())
     asyncio.create_task(cleanup_db_task())
     
     await bot.delete_webhook(drop_pending_updates=True)
-    print("🚀 Бот успешно запущен и готов к работе!")
+    logging.info("🚀 Бот с абсолютным логированием и диагностикой баланса запущен!")
     await dp.start_polling(bot)
 
 
