@@ -113,6 +113,14 @@ def _sync_upload_single():
     with db_lock:
         if not os.path.exists(DB_FILE):
             return False
+        
+        # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: принудительный сброс всех транзакций из WAL-файла в database.db
+        if db:
+            try:
+                db.execute("PRAGMA wal_checkpoint(FULL);")
+            except Exception as e:
+                print(f"⚠️ Ошибка вызова wal_checkpoint: {e}")
+
         with open(DB_FILE, "rb") as f:
             content_bytes = f.read()
 
@@ -162,8 +170,9 @@ async def _github_sync_worker():
         await sync_event.wait()
         sync_event.clear()
 
-        is_db_dirty = False
-        await asyncio.to_thread(_sync_upload_single)
+        success = await asyncio.to_thread(_sync_upload_single)
+        if success:
+            is_db_dirty = False
 
         if is_db_dirty:
             sync_event.set()
