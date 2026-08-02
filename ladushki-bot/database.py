@@ -68,6 +68,14 @@ async def init_db() -> None:
                 date TEXT
             );
         """)
+
+        # Таблица для хранения настроек группы (включая правила)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+        """)
         
         await db.commit()
         await upload_database()
@@ -310,6 +318,28 @@ async def set_active_title(user_id: int, title_key: str) -> None:
     """Устанавливает активный титул."""
     async with aiosqlite.connect(Config.DB_FILE) as db:
         await db.execute("UPDATE users SET active_title = ? WHERE user_id = ?", (title_key, user_id))
+        await db.commit()
+        await upload_database()
+
+
+# --- Функции правил ---
+
+async def get_rules() -> Optional[str]:
+    """Получает сохранённые правила группы из БД."""
+    async with aiosqlite.connect(Config.DB_FILE) as db:
+        async with db.execute("SELECT value FROM settings WHERE key = 'group_rules'", ()) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+
+async def set_rules(rules_text: str) -> None:
+    """Сохраняет или обновляет правила группы в БД."""
+    async with aiosqlite.connect(Config.DB_FILE) as db:
+        await db.execute("""
+            INSERT INTO settings (key, value)
+            VALUES ('group_rules', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+        """, (rules_text,))
         await db.commit()
         await upload_database()
 
