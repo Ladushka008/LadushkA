@@ -19,6 +19,11 @@ async def bot_reply(message: Message):
     await message.reply("Тут я, тут")
 
 
+@router.message(F.text.lower() == "минута ладушек")
+async def ladushka_minute_handler(message: Message):
+    await message.answer("👏 Минута ладушек проходит каждый день в 19:00 по киевскому времени")
+
+
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await db.ensure_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
@@ -28,6 +33,7 @@ async def cmd_start(message: Message):
         "• Напишите <b>профиль</b> — чтобы посмотреть свой профиль.\n"
         "• Напишите <b>баланс</b> — чтобы узнать счет.\n"
         "• Напишите <b>бонус</b> — чтобы получить ежедневный бонус.\n"
+        "• Напишите <b>минута ладушек</b> — узнать время проведения минуты ладушек.\n"
         "• Напишите <b>баскетбол 50</b> — сыграть в баскетбольную мини-игру 🏀\n"
         "• Напишите <b>магазин</b> — чтобы открыть магазин предметов.\n"
         "• Напишите <b>инвентарь</b> — чтобы посмотреть свои предметы.\n"
