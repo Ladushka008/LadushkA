@@ -2,11 +2,22 @@ import asyncio
 import random
 from aiogram import Router, F, Bot
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.filters.callback_data import CallbackData
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from config import Config
 import database as db
 
 router = Router()
+
+
+# Фабрики callback-данных для работы с титулами
+class TitleBuyCB(CallbackData, prefix="buy_title"):
+    action: str  # "confirm" или "cancel"
+    key: str
+
+
+class TitleSelectCB(CallbackData, prefix="select_title"):
+    key: str
 
 
 def get_mention(user) -> str:
@@ -34,6 +45,8 @@ async def cmd_start(message: Message):
         "• Напишите <b>баланс</b> — чтобы узнать счет.\n"
         "• Напишите <b>бонус</b> — чтобы получить ежедневный бонус.\n"
         "• Напишите <b>минута ладушек</b> — узнать время проведения минуты ладушек.\n"
+        "• Напишите <b>титулы</b> — открыть магазин титулов.\n"
+        "• Напишите <b>мои титулы</b> — посмотреть свои титулы и выбрать активный.\n"
         "• Напишите <b>баскетбол 50</b> — сыграть в баскетбольную мини-игру 🏀\n"
         "• Напишите <b>магазин</b> — чтобы открыть магазин предметов.\n"
         "• Напишите <b>инвентарь</b> — чтобы посмотреть свои предметы.\n"
@@ -57,16 +70,140 @@ async def profile_handler(message: Message):
     await db.ensure_user(target.id, target.username, target.full_name)
     user_data = await db.get_user_data(target.id)
     items_count = await db.get_total_items(target.id)
+    active_title = await db.get_active_title(target.id) or "Нет"
 
     if user_data:
         _, _, full_name, balance, _, _, reputation = user_data
         text = (
-            f"👤 <b>Имя:</b> {full_name}\n\n"
-            f"💰 <b>Баланс:</b> {balance} ладушек\n\n"
-            f"🎒 <b>Предметов:</b> {items_count}\n\n"
+            f"👤 <b>Имя:</b> {full_name}\n"
+            f"👏 <b>Баланс:</b> {balance} ладушек\n"
+            f"🏷 <b>Титул:</b> {active_title}\n"
+            f"🎒 <b>Предметов:</b> {items_count}\n"
             f"⭐ <b>Репутация:</b> {reputation}/10"
         )
         await message.answer(text, disable_web_page_preview=True)
+
+
+@router.message(F.text.lower() == "титулы")
+async def titles_shop_handler(message: Message):
+    text = (
+        "🏷 <b>Титулы ладушника</b>\n\n"
+        "🪵 <b>Деревянный ладушник</b>\n"
+        "💰 Цена: 50 👏\n\n"
+        "🥉 <b>Бронзовый ладушник</b>\n"
+        "💰 Цена: 200 👏\n\n"
+        "🥈 <b>Серебряный ладушник</b>\n"
+        "💰 Цена: 600 👏\n\n"
+        "🥇 <b>Золотой ладушник</b>\n"
+        "💰 Цена: 1000 👏"
+    )
+    await message.answer(text)
+
+
+@router.message(F.text.func(lambda text: text and any(k.lower() == text.lower() for k in db.TITLES.keys())))
+async def title_buy_request(message: Message):
+    user = message.from_user
+    await db.ensure_user(user.id, user.username, user.full_name)
+
+    matched_key = next(k for k in db.TITLES.keys() if k.lower() == message.text.lower())
+    title_info = db.TITLES[matched_key]
+
+    owned_titles = await db.get_user_titles(user.id)
+    if matched_key in owned_titles:
+        await message.reply("🏷 У вас уже куплен этот титул! Напишите <b>мои титулы</b>, чтобы выбрать его.")
+        return
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Купить", callback_data=TitleBuyCB(action="confirm", key=matched_key).pack()),
+                InlineKeyboardButton(text="❌ Отмена", callback_data=TitleBuyCB(action="cancel", key=matched_key).pack()),
+            ]
+        ]
+    )
+
+    await message.reply(
+        f"Вы хотите купить титул {title_info['name']} за {title_info['price']} 👏?",
+        reply_markup=kb
+    )
+
+
+@router.callback_query(TitleBuyCB.filter())
+async def process_title_buy_callback(query: CallbackQuery, callback_data: TitleBuyCB):
+    user_id = query.from_user.id
+    title_key = callback_data.key
+    title_info = db.TITLES.get(title_key)
+
+    if not title_info:
+        await query.answer("Титул не найден.", show_alert=True)
+        return
+
+    if callback_data.action == "cancel":
+        await query.message.edit_text("❌ Покупка титула отменена.")
+        await query.answer()
+        return
+
+    if callback_data.action == "confirm":
+        success = await db.buy_title(user_id, title_key, title_info["price"])
+        if success:
+            await query.message.edit_text(f"🎉 Вы успешно купили титул {title_info['name']}!")
+            await query.answer("Покупка успешно завершена!")
+        else:
+            balance = await db.get_balance(user_id)
+            await query.message.edit_text(
+                f"❌ <b>Недостаточно ладушек!</b>\n"
+                f"Стоимость: {title_info['price']} 👏\n"
+                f"Ваш баланс: {balance} 👏"
+            )
+            await query.answer()
+
+
+@router.message(F.text.lower() == "мои титулы")
+async def my_titles_handler(message: Message):
+    user_id = message.from_user.id
+    await db.ensure_user(user_id, message.from_user.username, message.from_user.full_name)
+
+    owned_keys = await db.get_user_titles(user_id)
+    if not owned_keys:
+        await message.reply("🎒 У вас пока нет купленных титулов. Напишите <b>титулы</b>, чтобы открыть магазин.")
+        return
+
+    active_key = await db.get_active_title_key(user_id)
+
+    text = "🏷 <b>Мои титулы</b>\n\n"
+    buttons = []
+
+    for key in owned_keys:
+        info = db.TITLES.get(key)
+        if not info:
+            continue
+        is_active = (key == active_key)
+        status = " ✅" if is_active else ""
+        text += f"{info['name']}{status}\n"
+
+        if not is_active:
+            buttons.append([InlineKeyboardButton(text=f"Выбрать {info['name']}", callback_data=TitleSelectCB(key=key).pack())])
+
+    text += f"\n<b>Активный титул:</b>\n{db.TITLES[active_key]['name'] if active_key in db.TITLES else 'Нет'}"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(TitleSelectCB.filter())
+async def process_title_select_callback(query: CallbackQuery, callback_data: TitleSelectCB):
+    user_id = query.from_user.id
+    title_key = callback_data.key
+    owned_keys = await db.get_user_titles(user_id)
+
+    if title_key not in owned_keys:
+        await query.answer("У вас нет этого титула!", show_alert=True)
+        return
+
+    await db.set_active_title(user_id, title_key)
+    title_name = db.TITLES[title_key]["name"]
+    await query.message.edit_text(f"✅ Активный титул изменён на: {title_name}")
+    await query.answer("Титул установлен!")
 
 
 @router.message(F.text.lower() == "баланс")
