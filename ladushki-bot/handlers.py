@@ -100,21 +100,51 @@ async def titles_shop_handler(message: Message):
     await message.answer(text)
 
 
-# Обновленный хэндлер запроса покупки титула
+# Перенесено ВЫШЕ, чтобы команда обрабатывалась сразу
+@router.message(F.text.lower() == "мои титулы")
+async def my_titles_handler(message: Message):
+    user_id = message.from_user.id
+    await db.ensure_user(user_id, message.from_user.username, message.from_user.full_name)
+
+    owned_keys = await db.get_user_titles(user_id)
+    if not owned_keys:
+        await message.reply("🎒 У вас пока нет купленных титулов. Напишите <b>титулы</b>, чтобы открыть магазин.")
+        return
+
+    active_key = await db.get_active_title_key(user_id)
+
+    text = "🏷 <b>Мои титулы</b>\n\n"
+    buttons = []
+
+    for key in owned_keys:
+        info = db.TITLES.get(key)
+        if not info:
+            continue
+        is_active = (key == active_key)
+        status = " ✅" if is_active else ""
+        text += f"{info['name']}{status}\n"
+
+        if not is_active:
+            buttons.append([InlineKeyboardButton(text=f"Выбрать {info['name']}", callback_data=TitleSelectCB(key=key).pack())])
+
+    text += f"\n<b>Активный титул:</b>\n{db.TITLES[active_key]['name'] if active_key in db.TITLES else 'Нет'}"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+    await message.answer(text, reply_markup=kb)
+
+
+# Покупка титула проверяется ниже точных команд
 @router.message(F.text)
 async def title_buy_request(message: Message):
     user_text = message.text.strip().lower()
 
-    # Поиск соответствующего титула в базе
     matched_key = None
     for key, info in db.TITLES.items():
         title_name = info["name"].lower()
-        # Проверка прямого совпадения или вхождения слова (например, "деревянный ладушник" без эмодзи)
         if user_text == title_name or user_text in title_name or title_name in user_text:
             matched_key = key
             break
 
-    # Если отправленный текст не соответствует ни одному титулу — пропускаем
     if not matched_key:
         return
 
@@ -161,7 +191,9 @@ async def process_title_buy_callback(query: CallbackQuery, callback_data: TitleB
     if callback_data.action == "confirm":
         success = await db.buy_title(user_id, title_key, title_info["price"])
         if success:
-            await query.message.edit_text(f"🎉 Вы успешно купили титул {title_info['name']}!")
+            # Автоматически ставим титул активным после покупки
+            await db.set_active_title(user_id, title_key)
+            await query.message.edit_text(f"🎉 Вы успешно купили и установили титул {title_info['name']}!")
             await query.answer("Покупка успешно завершена!")
         else:
             balance = await db.get_balance(user_id)
@@ -171,38 +203,6 @@ async def process_title_buy_callback(query: CallbackQuery, callback_data: TitleB
                 f"Ваш баланс: {balance} 👏"
             )
             await query.answer()
-
-
-@router.message(F.text.lower() == "мои титулы")
-async def my_titles_handler(message: Message):
-    user_id = message.from_user.id
-    await db.ensure_user(user_id, message.from_user.username, message.from_user.full_name)
-
-    owned_keys = await db.get_user_titles(user_id)
-    if not owned_keys:
-        await message.reply("🎒 У вас пока нет купленных титулов. Напишите <b>титулы</b>, чтобы открыть магазин.")
-        return
-
-    active_key = await db.get_active_title_key(user_id)
-
-    text = "🏷 <b>Мои титулы</b>\n\n"
-    buttons = []
-
-    for key in owned_keys:
-        info = db.TITLES.get(key)
-        if not info:
-            continue
-        is_active = (key == active_key)
-        status = " ✅" if is_active else ""
-        text += f"{info['name']}{status}\n"
-
-        if not is_active:
-            buttons.append([InlineKeyboardButton(text=f"Выбрать {info['name']}", callback_data=TitleSelectCB(key=key).pack())])
-
-    text += f"\n<b>Активный титул:</b>\n{db.TITLES[active_key]['name'] if active_key in db.TITLES else 'Нет'}"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
-    await message.answer(text, reply_markup=kb)
 
 
 @router.callback_query(TitleSelectCB.filter())
