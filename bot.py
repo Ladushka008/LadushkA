@@ -105,13 +105,12 @@ def update_db_meta():
         return
     try:
         now_str = datetime.now().isoformat()
-        cur = db.cursor()
-        cur.execute("SELECT MAX(id) FROM history;")
-        row = cur.fetchone()
+        cursor.execute("SELECT MAX(id) FROM history;")
+        row = cursor.fetchone()
         max_id = row[0] if row and row[0] is not None else 0
 
-        cur.execute("INSERT OR REPLACE INTO db_meta (key, value) VALUES ('last_modified', ?);", (now_str,))
-        cur.execute("INSERT OR REPLACE INTO db_meta (key, value) VALUES ('max_op_id', ?);", (str(max_id),))
+        cursor.execute("INSERT OR REPLACE INTO db_meta (key, value) VALUES ('last_modified', ?);", (now_str,))
+        cursor.execute("INSERT OR REPLACE INTO db_meta (key, value) VALUES ('max_op_id', ?);", (str(max_id),))
     except Exception as e:
         logging.error(f"⚠️ Ошибка обновления метаданных БД: {e}")
 
@@ -217,8 +216,41 @@ async def balance_checker_task():
 
 
 # ==========================
-# GITHUB СИНХРОНИЗАЦИЯ (ТОЛЬКО РЕЗЕРВНОЕ КОПИРОВАНИЕ)
+# GITHUB СИНХРОНИЗАЦИЯ
 # ==========================
+
+def _sync_download_once():
+    """
+    Вызывается СТРОГО один раз при старте до инициализации соединения с SQLite.
+    Скачивает актуальный файл БД из репозитория GitHub, если он существует.
+    """
+    EVENT_TRACKER["sync_download_called"] = True
+    EVENT_TRACKER["last_sync_download_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        logging.info("ℹ️ GitHub токен или репозиторий не заданы. Скачивание пропущено.")
+        return
+
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+
+    try:
+        resp = requests.get(url, headers=headers, params={"ref": BRANCH}, timeout=15)
+        if resp.status_code == 200:
+            content_b64 = resp.json().get("content", "")
+            if content_b64:
+                file_bytes = base64.b64decode(content_b64)
+                with open(DB_FILE, "wb") as f:
+                    f.write(file_bytes)
+                logging.info(f"🟢 [_sync_download_once] База данных успешно загружена с GitHub. SHA256: {get_file_hash(DB_FILE)[:12]}")
+        else:
+            logging.warning(f"⚠️ [_sync_download_once] Файл базы на GitHub не найден или вернул код: {resp.status_code}")
+    except Exception as e:
+        logging.error(f"🔴 [_sync_download_once] Ошибка скачивания базы с GitHub: {e}")
+
 
 def _sync_upload_single():
     """Отправка локальной БД на GitHub в качестве бэкапа"""
@@ -235,7 +267,6 @@ def _sync_upload_single():
 
         if db:
             try:
-                # ВАЖНО: Фиксируем все WAL-данные в основной файл перед отправкой
                 cursor.execute("PRAGMA wal_checkpoint(TRUNCATE);")
                 db.commit()
             except Exception as e:
@@ -307,49 +338,8 @@ def save_db_changes():
 
 
 # ==========================
-# БЭКАПЫ И ЗАЩИЩЕННОЕ ВОССТАНОВЛЕНИЕ
+# БЭКАПЫ С ИСПОЛЬЗОВАНИЕМ ЕДИНОГО СОЕДИНЕНИЯ
 # ==========================
-
-def get_db_info(db_path: str):
-    """
-    Извлекает метаданные базы данных (max_op_id и last_modified) для сравнения версий.
-    """
-    if not os.path.exists(db_path):
-        return None, None
-    try:
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-        
-        # Проверка целостности
-        res = cur.execute("PRAGMA quick_check;").fetchone()
-        if not res or res[0] != "ok":
-            conn.close()
-            return None, None
-
-        max_op_id = 0
-        try:
-            cur.execute("SELECT MAX(id) FROM history;")
-            r = cur.fetchone()
-            if r and r[0] is not None:
-                max_op_id = r[0]
-        except Exception:
-            pass
-
-        last_modified = ""
-        try:
-            cur.execute("SELECT value FROM db_meta WHERE key='last_modified';")
-            r = cur.fetchone()
-            if r and r[0]:
-                last_modified = r[0]
-        except Exception:
-            pass
-
-        conn.close()
-        return max_op_id, last_modified
-    except Exception as e:
-        logging.error(f"🔴 Ошибка при получении метаданных БД ({db_path}): {e}")
-        return None, None
-
 
 def create_backup():
     if not os.path.exists(BACKUP_DIR):
@@ -361,10 +351,10 @@ def create_backup():
     with db_lock:
         if db:
             try:
-                # ВАЖНО: Выполняем wal_checkpoint перед бэкапом
                 cursor.execute("PRAGMA wal_checkpoint(TRUNCATE);")
                 db.commit()
 
+                # Используем встроенный механизм sqlite3.Connection.backup без открытия второго sqlite3.connect к основному файлу
                 bck = sqlite3.connect(backup_file)
                 db.backup(bck)
                 bck.close()
@@ -383,48 +373,14 @@ def create_backup():
             logging.error(f"🔴 Ошибка удаления бэкапа {oldest}: {e}")
 
 
-def check_and_restore_db():
-    """
-    Безопасная проверка и восстановление БД только при критическом повреждении текущей базы,
-    с обязательной защитой от отката (Rollback Protection).
-    """
-    if not os.path.exists(DB_FILE):
-        logging.info("ℹ️ Файл базы данных не найден на диске. Будет создана новая БД.")
-        return
-
-    curr_max_id, curr_modified = get_db_info(DB_FILE)
-    if curr_max_id is not None:
-        logging.info(f"🟢 Текущая БД исправна (Max Op ID: {curr_max_id}, Modified: {curr_modified}). Восстановление не требуется.")
-        return
-
-    logging.critical("⚠️ Обнаружено повреждение основной базы данных! Поиск подходящего бэкапа...")
-    backups = sorted(glob.glob(os.path.join(BACKUP_DIR, "backup_*.db")), key=os.path.getmtime, reverse=True)
-    
-    best_backup = None
-    best_max_id = -1
-
-    for bck in backups:
-        bck_max_id, bck_modified = get_db_info(bck)
-        if bck_max_id is not None:
-            if bck_max_id > best_max_id:
-                best_max_id = bck_max_id
-                best_backup = bck
-
-    if best_backup:
-        shutil.copy(best_backup, DB_FILE)
-        logging.info(f"🟢 База данных успешно восстановлена из бэкапа: {best_backup} (Max Op ID: {best_max_id})")
-    else:
-        logging.error("🔴 Ни один исправный бэкап не найден. Файл будет создан с нуля.")
-        if os.path.exists(DB_FILE):
-            os.remove(DB_FILE)
-
-
 async def init_db():
     global db, cursor
-    # 1. Проверяем локальную целостность (без автоматического скачивания с GitHub)
-    await asyncio.to_thread(check_and_restore_db)
+    
+    # СТРОГО 1 РАЗ при старте загружаем свежий файл с GitHub (до открытия SQLite соединения)
+    await asyncio.to_thread(_sync_download_once)
 
     track_sqlite_connect()
+    # ЕДИНСТВЕННЫЙ вызов sqlite3.connect во всей системе
     db = sqlite3.connect(DB_FILE, check_same_thread=False)
     cursor = db.cursor()
 
@@ -432,7 +388,6 @@ async def init_db():
         try:
             cursor.execute("PRAGMA journal_mode=WAL;")
             
-            # Мета-таблица для контроля версий
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS db_meta(
                 key TEXT PRIMARY KEY,
@@ -1531,10 +1486,8 @@ async def on_shutdown():
 async def main():
     abs_db_path = os.path.abspath(DB_FILE)
     logging.info(f"📍 [ENV_CHECK] Абсолютный путь к базе данных: {abs_db_path}")
-    logging.info(f"📍 [ENV_CHECK] Файл database.db существует до инициализации: {os.path.exists(DB_FILE)}")
-    if os.path.exists(DB_FILE):
-        logging.info(f"📍 [ENV_CHECK] Начальный SHA256 DB: {get_file_hash(DB_FILE)[:12]}")
 
+    # Инициализация соединений и скачивание актуальной базы СТРОГО 1 раз при старте
     await init_db()
     await start_web_server()
     
