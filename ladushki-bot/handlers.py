@@ -1,6 +1,6 @@
 import asyncio
 import random
-from aiogram import Router, F, Bot
+from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -10,9 +10,8 @@ import database as db
 router = Router()
 
 
-# Фабрики callback-данных для работы с титулами
 class TitleBuyCB(CallbackData, prefix="buy_title"):
-    action: str  # "confirm" или "cancel"
+    action: str
     key: str
 
 
@@ -95,17 +94,18 @@ async def titles_shop_handler(message: Message):
         "🥈 <b>Серебряный ладушник</b>\n"
         "💰 Цена: 600 👏\n\n"
         "🥇 <b>Золотой ладушник</b>\n"
-        "💰 Цена: 1000 👏"
+        "💰 Цена: 1000 👏\n\n"
+        "<i>Чтобы купить титул, напишите его название (например: <code>Деревянный ладушник</code>).</i>"
     )
     await message.answer(text)
 
 
-@router.message(F.text.func(lambda text: text and any(k.lower() == text.lower() for k in db.TITLES.keys())))
+@router.message(F.text.func(lambda text: text and any(info["name"].lower() == text.lower() for info in db.TITLES.values())))
 async def title_buy_request(message: Message):
     user = message.from_user
     await db.ensure_user(user.id, user.username, user.full_name)
 
-    matched_key = next(k for k in db.TITLES.keys() if k.lower() == message.text.lower())
+    matched_key = next(k for k, v in db.TITLES.items() if v["name"].lower() == message.text.lower())
     title_info = db.TITLES[matched_key]
 
     owned_titles = await db.get_user_titles(user.id)
