@@ -387,28 +387,10 @@ async def my_titles_handler(message: Message):
     await message.answer(text, reply_markup=kb)
 
 
-# --- АДМИНИСТРАТИВНЫЕ КОМАНДЫ ---
+# --- АДМИНИСТРАТИВНЫЕ КОМАНДЫ (/add и /revelo) ---
 
-@router.message(Command("set_balance"))
-async def admin_set_balance(message: Message):
-    if message.from_user.id != Config.ADMIN_ID or not message.reply_to_message or not message.reply_to_message.from_user:
-        return
-
-    target = message.reply_to_message.from_user
-    await db.ensure_user(target.id, target.username, target.full_name)
-
-    args = message.text.split()
-    if len(args) != 2 or not args[1].isdigit():
-        await message.reply("❌ Использование: ответьте на сообщение и напишите /set_balance [сумма]")
-        return
-
-    amount = int(args[1])
-    await db.set_balance(target.id, amount)
-    await message.answer(f"✅ Баланс игрока {get_mention(target)} изменён на {amount}.", disable_web_page_preview=True)
-
-
-@router.message(Command("admin_bonus"))
-async def admin_bonus(message: Message):
+@router.message(Command("add"))
+async def admin_add_balance(message: Message):
     if message.from_user.id != Config.ADMIN_ID or not message.reply_to_message or not message.reply_to_message.from_user:
         return
 
@@ -417,14 +399,36 @@ async def admin_bonus(message: Message):
 
     args = message.text.split()
     if len(args) < 2 or not args[1].isdigit():
-        await message.reply("❌ Использование: ответьте на сообщение и напишите /admin_bonus [сумма]")
+        await message.reply("❌ Использование: ответьте на сообщение и напишите /add [сумма]")
         return
 
     amount = int(args[1])
     await db.update_balance(target.id, amount)
-    await db.add_history_entry(Config.ADMIN_ID, target.id, amount, "admin_bonus")
+    await db.add_history_entry(Config.ADMIN_ID, target.id, amount, "admin_add")
 
-    await message.answer(f"🎁 Игрок {get_mention(target)} получил бонус {amount} ладушек.", disable_web_page_preview=True)
+    new_bal = await db.get_balance(target.id)
+    await message.answer(f"✅ Баланс игрока {get_mention(target)} увеличен на {amount}. Новый баланс: {new_bal} 👏", disable_web_page_preview=True)
+
+
+@router.message(Command("revelo"))
+async def admin_revelo_balance(message: Message):
+    if message.from_user.id != Config.ADMIN_ID or not message.reply_to_message or not message.reply_to_message.from_user:
+        return
+
+    target = message.reply_to_message.from_user
+    await db.ensure_user(target.id, target.username, target.full_name)
+
+    args = message.text.split()
+    if len(args) < 2 or not args[1].isdigit():
+        await message.reply("❌ Использование: ответьте на сообщение и напишите /revelo [сумма]")
+        return
+
+    amount = int(args[1])
+    await db.update_balance(target.id, -amount)
+    await db.add_history_entry(Config.ADMIN_ID, target.id, -amount, "admin_revelo")
+
+    new_bal = await db.get_balance(target.id)
+    await message.answer(f"✅ У игрока {get_mention(target)} забрано {amount} ладушек. Новый баланс: {new_bal} 👏", disable_web_page_preview=True)
 
 
 @router.message(Command("reset"))
