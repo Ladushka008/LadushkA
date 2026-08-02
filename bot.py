@@ -476,7 +476,7 @@ async def start(message: Message):
         "• Напишите <b>профиль</b> — чтобы посмотреть свой профиль.\n"
         "• Напишите <b>баланс</b> — чтобы узнать счет.\n"
         "• Напишите <b>бонус</b> — чтобы получить ежедневный бонус.\n"
-        "• Напишите <b>баскетбол</b> — сыграть в баскетбольную мини-игру 🏀\n"
+        "• Напишите <b>баскетбол 50</b> — сыграть в баскетбольную мини-игру 🏀\n"
         "• Напишите <b>магазин</b> — чтобы открыть магазин предметов.\n"
         "• Напишите <b>инвентарь</b> — чтобы посмотреть свои предметы.\n"
         "• Напишите <b>репутация</b> — чтобы увидеть ТОП-5 по репутации.\n"
@@ -491,11 +491,29 @@ async def start(message: Message):
 # --- МИНИ-ИГРА БАСКЕТБОЛ ---
 
 @dp.message(Command("basketball"))
-@dp.message(F.text.lower().in_(["баскетбол", "баскет"]))
+@dp.message(F.text.lower().startswith("баскетбол"))
+@dp.message(F.text.lower().startswith("баскет"))
 async def basketball_game(message: Message):
     user = message.from_user
     if not is_user_registered(user.id):
         await message.reply("⚠️ Вы еще не зарегистрированы.\nПожалуйста, сначала откройте бота и нажмите /start.")
+        return
+
+    # Извлекаем сумму из аргументов (например: "баскетбол 100" или "/basketball 100")
+    parts = message.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.reply("⚠️ Укажите сумму числом. Пример: <code>баскетбол 50</code>")
+        return
+
+    amount = int(parts[1])
+    if amount <= 0:
+        await message.reply("❌ Сумма должна быть больше 0.")
+        return
+
+    # Проверяем, достаточно ли у пользователя средств
+    current_balance = get_balance(user.id)
+    if current_balance < amount:
+        await message.reply(f"❌ <b>Недостаточно ладушек.</b>\n\nВаш баланс: <b>{current_balance}</b> ладушек")
         return
 
     # 1. Отправляем кубик баскетбола
@@ -507,7 +525,7 @@ async def basketball_game(message: Message):
 
     # 3. Значения 4 и 5 соответствуют попаданию в корзину
     if score >= 4:
-        reward = 10
+        reward = int(amount * 0.3)  # +30% от указанной суммы
         with db_lock:
             try:
                 cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (reward, user.id))
@@ -528,7 +546,7 @@ async def basketball_game(message: Message):
             f"🪙 Ваш баланс: <b>{new_balance}</b>"
         )
     else:
-        loss = 5  # Размер штрафа/потери ладушек при промахе
+        loss = amount  # При промахе списывается указанная сумма
 
         with db_lock:
             try:
