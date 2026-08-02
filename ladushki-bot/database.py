@@ -15,6 +15,7 @@ TITLES = {
 async def init_db() -> None:
     async with aiosqlite.connect(Config.DB_FILE) as db:
         await db.execute("PRAGMA journal_mode=WAL;")
+        
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -27,6 +28,12 @@ async def init_db() -> None:
                 active_title TEXT DEFAULT NULL
             );
         """)
+
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN active_title TEXT DEFAULT NULL;")
+        except Exception:
+            pass
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS inventory (
                 user_id INTEGER,
@@ -35,6 +42,7 @@ async def init_db() -> None:
                 PRIMARY KEY (user_id, item_name)
             );
         """)
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS user_titles (
                 user_id INTEGER,
@@ -42,12 +50,14 @@ async def init_db() -> None:
                 PRIMARY KEY (user_id, title_key)
             );
         """)
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS rules (
                 id INTEGER PRIMARY KEY DEFAULT 1,
                 rules_text TEXT
             );
         """)
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,6 +106,12 @@ async def update_balance(user_id: int, amount: int) -> int:
         await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
         await db.commit()
         return await get_balance(user_id)
+
+
+async def set_balance(user_id: int, amount: int) -> None:
+    async with aiosqlite.connect(Config.DB_FILE) as db:
+        await db.execute("UPDATE users SET balance = ? WHERE user_id = ?", (amount, user_id))
+        await db.commit()
 
 
 async def claim_daily_bonus(user_id: int) -> Tuple[bool, int, Optional[timedelta]]:
@@ -232,6 +248,12 @@ async def get_random_user(exclude_id: int) -> Optional[int]:
             return random.choice(rows)[0]
 
 
+async def get_top_reputation() -> List[Tuple[str, int]]:
+    async with aiosqlite.connect(Config.DB_FILE) as db:
+        async with db.execute("SELECT full_name, reputation FROM users ORDER BY reputation DESC LIMIT 5") as cursor:
+            return await cursor.fetchall()
+
+
 async def add_history_entry(sender: int, receiver: int, amount: int, action: str, reason: str = "") -> None:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     async with aiosqlite.connect(Config.DB_FILE) as db:
@@ -239,4 +261,12 @@ async def add_history_entry(sender: int, receiver: int, amount: int, action: str
             "INSERT INTO history (sender, receiver, amount, action, reason, date) VALUES (?, ?, ?, ?, ?, ?)",
             (sender, receiver, amount, action, reason, now_str)
         )
+        await db.commit()
+
+
+async def reset_user(user_id: int) -> None:
+    async with aiosqlite.connect(Config.DB_FILE) as db:
+        await db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+        await db.execute("DELETE FROM inventory WHERE user_id = ?", (user_id,))
+        await db.execute("DELETE FROM user_titles WHERE user_id = ?", (user_id,))
         await db.commit()
