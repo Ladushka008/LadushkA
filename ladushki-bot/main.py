@@ -9,6 +9,7 @@ from aiogram.client.default import DefaultBotProperties
 
 from config import Config
 import database as db
+from github_storage import download_database
 from handlers import router
 
 logging.basicConfig(
@@ -58,10 +59,13 @@ async def daily_ladushki_task(bot: Bot) -> None:
 
 
 async def main() -> None:
-    # Инициализация БД
+    # 1. Скачиваем базу данных из GitHub (если она там есть)
+    await download_database()
+
+    # 2. Инициализация БД
     await db.init_db()
 
-    # Запуск веб-сервера
+    # 3. Запуск веб-сервера
     await start_web_server()
 
     bot = Bot(
