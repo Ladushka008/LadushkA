@@ -3,11 +3,18 @@ import random
 from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.filters.callback_data import CallbackData
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from config import Config
 import database as db
 
 router = Router()
+
+
+# Состояния для ввода правил администратором
+class RulesState(StatesGroup):
+    waiting_for_rules = State()
 
 
 class TitleBuyCB(CallbackData, prefix="buy_title"):
@@ -43,6 +50,7 @@ async def cmd_start(message: Message):
         "• Напишите <b>профиль</b> — чтобы посмотреть свой профиль.\n"
         "• Напишите <b>баланс</b> — чтобы узнать счет.\n"
         "• Напишите <b>бонус</b> — чтобы получить ежедневный бонус.\n"
+        "• Напишите <b>правила</b> или <b>права</b> — чтобы прочитать правила группы.\n"
         "• Напишите <b>минута ладушек</b> — узнать время проведения минуты ладушек.\n"
         "• Напишите <b>титулы</b> — открыть магазин титулов.\n"
         "• Напишите <b>мои титулы</b> — посмотреть свои титулы и выбрать активный.\n"
@@ -57,6 +65,72 @@ async def cmd_start(message: Message):
         "• Ответьте на сообщение текстом <b>кинуть томат</b> — бросить томат в участника."
     )
 
+
+# ------------------- РАЗДЕЛ "ПРАВИЛА" -------------------
+
+@router.message(F.text.lower().in_(["правила", "права", "📜 правила"]))
+async def rules_handler(message: Message):
+    rules_text = await db.get_rules() if hasattr(db, "get_rules") else None
+    is_admin = (message.from_user.id == Config.ADMIN_ID)
+
+    buttons = []
+    if is_admin:
+        btn_text = "✏️ Изменить правила" if rules_text else "➕ Добавить правила"
+        buttons.append([InlineKeyboardButton(text=btn_text, callback_data="add_rules_start")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+
+    if rules_text:
+        await message.answer(f"📜 <b>Правила группы:</b>\n\n{rules_text}", reply_markup=kb)
+    else:
+        text = (
+            "📜 <b>Правила</b>\n\n"
+            "Правила ещё не установлены.\n"
+            "Создайте правила для вашей группы, чтобы участники могли ознакомиться с ними."
+        )
+        await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "add_rules_start")
+async def add_rules_start_callback(query: CallbackQuery, state: FSMContext):
+    if query.from_user.id != Config.ADMIN_ID:
+        await query.answer("⛔ Только администратор может изменять правила.", show_alert=True)
+        return
+
+    await state.set_state(RulesState.waiting_for_rules)
+    
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_rules_input")]]
+    )
+    
+    await query.message.answer("📝 Отправьте текст правил для вашей группы:", reply_markup=kb)
+    await query.answer()
+
+
+@router.callback_query(F.data == "cancel_rules_input")
+async def cancel_rules_input(query: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await query.message.edit_text("❌ Ввод правил отменён.")
+    await query.answer()
+
+
+@router.message(RulesState.waiting_for_rules)
+async def process_rules_input(message: Message, state: FSMContext):
+    if message.from_user.id != Config.ADMIN_ID:
+        return
+
+    new_rules = message.text
+    if hasattr(db, "set_rules"):
+        await db.set_rules(new_rules)
+
+    await state.clear()
+    await message.reply(
+        "✅ <b>Правила успешно установлены!</b>\n\n"
+        "Теперь участники смогут открыть раздел «📜 Правила» и ознакомиться с ними."
+    )
+
+
+# ---------------------------------------------------------
 
 @router.message(F.text.lower() == "профиль")
 async def profile_handler(message: Message):
@@ -100,7 +174,6 @@ async def titles_shop_handler(message: Message):
     await message.answer(text)
 
 
-# Перенесено ВЫШЕ, чтобы команда обрабатывалась сразу
 @router.message(F.text.lower() == "мои титулы")
 async def my_titles_handler(message: Message):
     user_id = message.from_user.id
@@ -133,7 +206,6 @@ async def my_titles_handler(message: Message):
     await message.answer(text, reply_markup=kb)
 
 
-# Покупка титула проверяется ниже точных команд
 @router.message(F.text)
 async def title_buy_request(message: Message):
     user_text = message.text.strip().lower()
@@ -191,7 +263,6 @@ async def process_title_buy_callback(query: CallbackQuery, callback_data: TitleB
     if callback_data.action == "confirm":
         success = await db.buy_title(user_id, title_key, title_info["price"])
         if success:
-            # Автоматически ставим титул активным после покупки
             await db.set_active_title(user_id, title_key)
             await query.message.edit_text(f"🎉 Вы успешно купили и установили титул {title_info['name']}!")
             await query.answer("Покупка успешно завершена!")
