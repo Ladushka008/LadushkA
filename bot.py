@@ -528,9 +528,26 @@ async def basketball_game(message: Message):
             f"🪙 Ваш баланс: <b>{new_balance}</b>"
         )
     else:
+        loss = 5  # Размер штрафа/потери ладушек при промахе
+
+        with db_lock:
+            try:
+                cursor.execute("UPDATE users SET balance = MAX(balance - ?, 0) WHERE user_id=?", (loss, user.id))
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                print(f"Ошибка при списании баланса в баскетболе: {e}")
+                return
+
+        save_db_changes()
+        add_history(user.id, 0, loss, "basketball_loss")
+        new_balance = get_balance(user.id)
+
         await message.reply(
-            f"❌ <b>ПРОМАХ!</b>\n\n"
-            f"😅 Мяч пролетел мимо корзины. Попробуйте еще раз!"
+            f"🏀 Бросок…\n"
+            f"😔 Промах!\n"
+            f"💸 Потеряно: <b>{loss}</b> ладушек.\n"
+            f"🪙 Текущий баланс: <b>{new_balance}</b> ладушек."
         )
 
 
