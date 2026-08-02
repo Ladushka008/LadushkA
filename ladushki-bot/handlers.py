@@ -286,8 +286,8 @@ async def use_battle_ladushka(message: Message):
     stolen = min(target_balance, 100)
     
     if stolen > 0:
-        await db.update_balance(target.id, -stolen)
-        await db.update_balance(attacker.id, stolen)
+        await db.remove_balance(target.id, stolen)
+        await db.add_balance(attacker.id, stolen)
         await message.reply(f"🥊 {get_mention(attacker)} ударил ладушкой {get_mention(target)} и отобрал <b>{stolen}</b> ладушек!")
     else:
         await message.reply(f"🥊 {get_mention(attacker)} ударил ладушкой {get_mention(target)}, но у него нечего забрать!")
@@ -335,8 +335,8 @@ async def use_rat(message: Message):
     stolen = min(victim_bal, random.randint(30, 80))
 
     if stolen > 0:
-        await db.update_balance(victim_id, -stolen)
-        await db.update_balance(user.id, stolen)
+        await db.remove_balance(victim_id, stolen)
+        await db.add_balance(user.id, stolen)
         await message.reply(f"🐀 Ваша крыса проникла к случайному игроку и утащила <b>{stolen}</b> ладушек!")
     else:
         await message.reply("🐀 Ваша крыса прибежала пустой.")
@@ -403,7 +403,7 @@ async def admin_add_balance(message: Message):
         return
 
     amount = int(args[1])
-    await db.update_balance(target.id, amount)
+    await db.add_balance(target.id, amount)
     await db.add_history_entry(Config.ADMIN_ID, target.id, amount, "admin_add")
 
     new_bal = await db.get_balance(target.id)
@@ -424,7 +424,7 @@ async def admin_revelo_balance(message: Message):
         return
 
     amount = int(args[1])
-    await db.update_balance(target.id, -amount)
+    await db.remove_balance(target.id, amount)
     await db.add_history_entry(Config.ADMIN_ID, target.id, -amount, "admin_revelo")
 
     new_bal = await db.get_balance(target.id)
@@ -441,7 +441,7 @@ async def admin_reset(message: Message):
     await message.answer(f"🔄 Данные игрока {get_mention(target)} сброшены.", disable_web_page_preview=True)
 
 
-# --- УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК ПОКУПКИ ТИТУЛОВ (СТРОГО В САМОМ КОНЦЕ!) ---
+# --- УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК ПОКУПКИ ТИТУЛОВ ---
 
 @router.message(F.text)
 async def title_buy_request(message: Message):
