@@ -63,10 +63,8 @@ is_db_dirty = False
 # СИСТЕМА ДИАГНОСТИКИ И ТРЕКИНГА БАЛАНСОВ
 # ==========================================
 
-# Кэш известных балансов: {user_id: balance}
 KNOWN_BALANCES = {}
 
-# Флаги активности и вызовов событий
 EVENT_TRACKER = {
     "sync_download_called": False,
     "last_sync_download_time": "Никогда",
@@ -76,7 +74,6 @@ EVENT_TRACKER = {
     "last_sqlite_connect_time": "Никогда"
 }
 
-# Информация о последнем обращении к БД
 LAST_DB_ACTION = {
     "function": "None",
     "timestamp": "None",
@@ -97,15 +94,33 @@ def get_file_hash(filepath: str) -> str:
 
 
 def track_sqlite_connect():
-    """Фиксирует подключение к базы через sqlite3.connect"""
+    """Фиксирует подключение к базе через sqlite3.connect"""
     EVENT_TRACKER["sqlite_connect_called"] = True
     EVENT_TRACKER["last_sqlite_connect_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def update_db_meta():
+    """Обновляет метаданные БД (время и максимальный ID истории)"""
+    if not db:
+        return
+    try:
+        now_str = datetime.now().isoformat()
+        cur = db.cursor()
+        cur.execute("SELECT MAX(id) FROM history;")
+        row = cur.fetchone()
+        max_id = row[0] if row and row[0] is not None else 0
+
+        cur.execute("INSERT OR REPLACE INTO db_meta (key, value) VALUES ('last_modified', ?);", (now_str,))
+        cur.execute("INSERT OR REPLACE INTO db_meta (key, value) VALUES ('max_op_id', ?);", (str(max_id),))
+    except Exception as e:
+        logging.error(f"⚠️ Ошибка обновления метаданных БД: {e}")
+
+
 def log_db_commit(caller_name: str):
-    """Выполняет commit() с фиксированием имени выгрузившей функции и SHA256"""
+    """Выполняет commit() с фиксированием метаданных и SHA256"""
     global LAST_DB_ACTION
     if db:
+        update_db_meta()
         db.commit()
         db_hash = get_file_hash(DB_FILE)
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -115,11 +130,7 @@ def log_db_commit(caller_name: str):
 
 
 def change_user_balance(user_id: int, new_balance: int, caller_function: str, reason: str = "") -> int:
-    """
-    Единая точка изменения баланса.
-    Перехватывает изменение, логирует (функцию, user_id, ДО, ПОСЛЕ, время),
-    выполняет commit, обновляет локальный кэш и создает таймер проверки через 10 минут.
-    """
+    """Единая точка изменения баланса."""
     global KNOWN_BALANCES
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
@@ -128,11 +139,9 @@ def change_user_balance(user_id: int, new_balance: int, caller_function: str, re
         row = cursor.fetchone()
         old_balance = row[0] if row else 0
 
-        # Прямое принудительное обновление
         cursor.execute("UPDATE users SET balance = ? WHERE user_id=?", (new_balance, user_id))
         log_db_commit(caller_function)
 
-        # Обновляем локальный кэш
         KNOWN_BALANCES[user_id] = new_balance
 
     db_hash = get_file_hash(DB_FILE)
@@ -149,13 +158,11 @@ def change_user_balance(user_id: int, new_balance: int, caller_function: str, re
 
     save_db_changes()
     
-    # Запуск таймера проверки через 10 минут (600 сек)
     asyncio.create_task(verify_balance_after_delay(user_id, new_balance, caller_function, delay=600))
     return old_balance
 
 
 async def verify_balance_after_delay(user_id: int, expected_bal: int, original_caller: str, delay: int = 600):
-    """Проверяет баланс конкретного пользователя через 10 минут"""
     await asyncio.sleep(delay)
     current_bal = get_balance(user_id)
     current_hash = get_file_hash(DB_FILE)
@@ -166,23 +173,19 @@ async def verify_balance_after_delay(user_id: int, expected_bal: int, original_c
             f"├─ User ID: {user_id}\n"
             f"├─ Ожидаемый баланс: {expected_bal}\n"
             f"├─ Фактический баланс: {current_bal}\n"
-            f"├─ Исходная функция изменения (10 мин назад): {original_caller}\n"
-            f"├─ Последняя функция, вызвавшая commit(): {LAST_DB_ACTION['function']} (в {LAST_DB_ACTION['timestamp']})\n"
+            f"├─ Исходная функция изменения: {original_caller}\n"
+            f"├─ Последняя функция commit(): {LAST_DB_ACTION['function']} ({LAST_DB_ACTION['timestamp']})\n"
             f"└─ SHA256 DB: {current_hash[:12]}"
         )
     else:
         logging.info(
-            f"✅ [10-MIN VERIFY OK] Баланс User ID {user_id} через {delay // 60} мин корректен ({current_bal}). SHA256: {current_hash[:12]}"
+            f"✅ [10-MIN VERIFY OK] Баланс User ID {user_id} корректен ({current_bal}). SHA256: {current_hash[:12]}"
         )
 
 
 async def balance_checker_task():
-    """
-    Каждые 30 секунд автоматически проверяет баланс всех пользователей в базе.
-    Если баланс изменился без вызова функции — мгновенно выводится полная диагностика.
-    """
     global KNOWN_BALANCES
-    logging.info("🔍 [MONITOR] Автоматический монитор балансов (30 сек) запущен.")
+    logging.info("🔍 [MONITOR] Автоматический монитор балансов запущен.")
 
     while True:
         await asyncio.sleep(30)
@@ -193,7 +196,7 @@ async def balance_checker_task():
                 cursor.execute("SELECT user_id, balance FROM users")
                 rows = cursor.fetchall()
             except Exception as e:
-                logging.error(f"🔴 Ошибка чтения БД во время фоновой проверки: {e}")
+                logging.error(f"🔴 Ошибка чтения БД во время мониторинга: {e}")
                 continue
 
         current_db_hash = get_file_hash(DB_FILE)
@@ -202,71 +205,23 @@ async def balance_checker_task():
             if user_id in KNOWN_BALANCES:
                 expected_bal = KNOWN_BALANCES[user_id]
                 if current_bal != expected_bal:
-                    # БАЛАНС ИЗМЕНИЛСЯ БЕЗ ВЫЗОВА ФУНКЦИИ ИЗМЕНЕНИЯ!
                     logging.critical(
-                        f"\n🚨🚨🚨 [ALERT! САНКЦИОНИРОВАННЫЙ/ВНЕШНИЙ ОТКАТ БАЛАНСА!] 🚨🚨🚨\n"
+                        f"\n🚨🚨🚨 [ALERT! РАССИНХРОН/ОТКАТ БАЛАНСА!] 🚨🚨🚨\n"
                         f"├─ User ID: {user_id}\n"
-                        f"├─ Старое значение (в кэше): {expected_bal}\n"
-                        f"├─ Новое значение (в БД): {current_bal}\n"
-                        f"├─ Точное время: {now_str}\n"
-                        f"├─ SHA256 файла database.db: {current_db_hash}\n"
-                        f"├─ Был ли вызван _sync_download: {EVENT_TRACKER['sync_download_called']} (в {EVENT_TRACKER['last_sync_download_time']})\n"
-                        f"├─ Был ли вызван _sync_upload_single: {EVENT_TRACKER['sync_upload_called']} (в {EVENT_TRACKER['last_sync_upload_time']})\n"
-                        f"├─ Был ли открыт новый sqlite3.connect: {EVENT_TRACKER['sqlite_connect_called']} (в {EVENT_TRACKER['last_sqlite_connect_time']})\n"
-                        f"└─ Последняя функция, коммитившая в БД: {LAST_DB_ACTION['function']} (в {LAST_DB_ACTION['timestamp']})"
+                        f"├─ Ожидалось (в кэше): {expected_bal}\n"
+                        f"├─ Найдено (в БД): {current_bal}\n"
+                        f"├─ Время: {now_str}\n"
+                        f"└─ SHA256 DB: {current_db_hash}"
                     )
-            # Обновляем кэш, чтобы лог не дублировался каждую итерацию
             KNOWN_BALANCES[user_id] = current_bal
 
 
 # ==========================
-# GITHUB СИНХРОНИЗАЦИЯ
+# GITHUB СИНХРОНИЗАЦИЯ (ТОЛЬКО РЕЗЕРВНОЕ КОПИРОВАНИЕ)
 # ==========================
 
-def _sync_download():
-    """Скачивает базу из GitHub с подробным логированием"""
-    EVENT_TRACKER["sync_download_called"] = True
-    EVENT_TRACKER["last_sync_download_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    if not GITHUB_TOKEN or not GITHUB_REPO:
-        logging.warning("⚠️ [_sync_download] GitHub Sync пропущен: не задан токен или репозиторий.")
-        return False
-
-    if os.path.exists(DB_FILE):
-        logging.info(f"🟡 [_sync_download] База данных уже существует. SHA256: {get_file_hash(DB_FILE)[:12]}. Загрузка с GitHub отменена.")
-        return True
-
-    logging.info("📥 [_sync_download] Файл database.db отсутствует. Начинаем загрузку с GitHub...")
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
-    headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-
-    try:
-        response = requests.get(url, headers=headers, params={"ref": BRANCH}, timeout=15)
-        if response.status_code == 200:
-            res_json = response.json()
-            content_b64 = res_json.get("content", "")
-            file_data = base64.b64decode(content_b64)
-
-            with db_lock:
-                with open(DB_FILE, "wb") as f:
-                    f.write(file_data)
-
-            new_hash = get_file_hash(DB_FILE)
-            logging.info(f"🟢 [_sync_download] База успешно скачана с GitHub! SHA256: {new_hash[:12]}")
-            return True
-        else:
-            logging.error(f"🔴 [_sync_download] Ошибка скачивания с GitHub. Статус: {response.status_code}")
-            return False
-    except Exception as e:
-        logging.error(f"🔴 [_sync_download] Ошибка при выгрузке: {e}")
-        return False
-
-
 def _sync_upload_single():
-    """Отправка локальной БД на GitHub с полным контролем хешей"""
+    """Отправка локальной БД на GitHub в качестве бэкапа"""
     EVENT_TRACKER["sync_upload_called"] = True
     EVENT_TRACKER["last_sync_upload_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -275,12 +230,14 @@ def _sync_upload_single():
 
     with db_lock:
         if not os.path.exists(DB_FILE):
-            logging.error("🔴 [_sync_upload_single] Отмена выгрузки: Файл database.db не существует.")
+            logging.error("🔴 [_sync_upload_single] Отмена: Файл database.db не существует.")
             return False
 
         if db:
             try:
-                db.execute("PRAGMA wal_checkpoint(FULL);")
+                # ВАЖНО: Фиксируем все WAL-данные в основной файл перед отправкой
+                cursor.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                db.commit()
             except Exception as e:
                 logging.warning(f"⚠️ [_sync_upload_single] Ошибка wal_checkpoint: {e}")
 
@@ -288,7 +245,7 @@ def _sync_upload_single():
         with open(DB_FILE, "rb") as f:
             content_bytes = f.read()
 
-    logging.info(f"📤 [_sync_upload_single] Выгрузка базы на GitHub... SHA256: {file_hash[:12]}")
+    logging.info(f"📤 [_sync_upload_single] Отправка бэкапа базы на GitHub... SHA256: {file_hash[:12]}")
 
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
     headers = {
@@ -296,7 +253,7 @@ def _sync_upload_single():
         "Accept": "application/vnd.github.v3+json"
     }
 
-    max_retries = 5
+    max_retries = 3
     for attempt in range(1, max_retries + 1):
         try:
             content_b64 = base64.b64encode(content_bytes).decode("utf-8")
@@ -307,7 +264,7 @@ def _sync_upload_single():
                 sha = get_resp.json().get("sha")
 
             data = {
-                "message": f"Auto-update database.db [{datetime.now().strftime('%H:%M:%S')}] SHA256: {file_hash[:8]}",
+                "message": f"Backup database.db [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] SHA256: {file_hash[:8]}",
                 "content": content_b64,
                 "branch": BRANCH
             }
@@ -316,10 +273,10 @@ def _sync_upload_single():
 
             put_resp = requests.put(url, headers=headers, json=data, timeout=15)
             if put_resp.status_code in [200, 201]:
-                logging.info(f"🟢 [_sync_upload_single] Файл отправлен на GitHub! SHA256: {file_hash[:12]}")
+                logging.info(f"🟢 [_sync_upload_single] Бэкап отправлен на GitHub! SHA256: {file_hash[:12]}")
                 return True
             else:
-                logging.warning(f"⚠️ [_sync_upload_single] Статус ответа GitHub: {put_resp.status_code} (попытка {attempt}/{max_retries})")
+                logging.warning(f"⚠️ [_sync_upload_single] Ответ GitHub: {put_resp.status_code} (попытка {attempt}/{max_retries})")
         except Exception as e:
             logging.error(f"⚠️ [_sync_upload_single] Ошибка отправки: {e} (попытка {attempt}/{max_retries})")
 
@@ -330,7 +287,6 @@ def _sync_upload_single():
 
 
 async def _github_sync_worker():
-    """Фоновый воркер отправки изменений на GitHub"""
     global is_db_dirty
     while True:
         await sync_event.wait()
@@ -345,15 +301,55 @@ async def _github_sync_worker():
 
 
 def save_db_changes():
-    """Планирует моментальную выгрузку на GitHub"""
     global is_db_dirty
     is_db_dirty = True
     sync_event.set()
 
 
 # ==========================
-# БЭКАПЫ И ИНИЦИАЛИЗАЦИЯ
+# БЭКАПЫ И ЗАЩИЩЕННОЕ ВОССТАНОВЛЕНИЕ
 # ==========================
+
+def get_db_info(db_path: str):
+    """
+    Извлекает метаданные базы данных (max_op_id и last_modified) для сравнения версий.
+    """
+    if not os.path.exists(db_path):
+        return None, None
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        
+        # Проверка целостности
+        res = cur.execute("PRAGMA quick_check;").fetchone()
+        if not res or res[0] != "ok":
+            conn.close()
+            return None, None
+
+        max_op_id = 0
+        try:
+            cur.execute("SELECT MAX(id) FROM history;")
+            r = cur.fetchone()
+            if r and r[0] is not None:
+                max_op_id = r[0]
+        except Exception:
+            pass
+
+        last_modified = ""
+        try:
+            cur.execute("SELECT value FROM db_meta WHERE key='last_modified';")
+            r = cur.fetchone()
+            if r and r[0]:
+                last_modified = r[0]
+        except Exception:
+            pass
+
+        conn.close()
+        return max_op_id, last_modified
+    except Exception as e:
+        logging.error(f"🔴 Ошибка при получении метаданных БД ({db_path}): {e}")
+        return None, None
+
 
 def create_backup():
     if not os.path.exists(BACKUP_DIR):
@@ -365,6 +361,10 @@ def create_backup():
     with db_lock:
         if db:
             try:
+                # ВАЖНО: Выполняем wal_checkpoint перед бэкапом
+                cursor.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                db.commit()
+
                 bck = sqlite3.connect(backup_file)
                 db.backup(bck)
                 bck.close()
@@ -384,47 +384,45 @@ def create_backup():
 
 
 def check_and_restore_db():
+    """
+    Безопасная проверка и восстановление БД только при критическом повреждении текущей базы,
+    с обязательной защитой от отката (Rollback Protection).
+    """
     if not os.path.exists(DB_FILE):
-        logging.info("ℹ️ Файл базы данных не найден на диске.")
+        logging.info("ℹ️ Файл базы данных не найден на диске. Будет создана новая БД.")
         return
 
-    is_corrupt = False
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        res = conn.execute("PRAGMA quick_check;").fetchone()
-        conn.close()
-        if not res or res[0] != "ok":
-            is_corrupt = True
-    except Exception as e:
-        logging.error(f"🔴 Ошибка проверки SQLite: {e}")
-        is_corrupt = True
+    curr_max_id, curr_modified = get_db_info(DB_FILE)
+    if curr_max_id is not None:
+        logging.info(f"🟢 Текущая БД исправна (Max Op ID: {curr_max_id}, Modified: {curr_modified}). Восстановление не требуется.")
+        return
 
-    if is_corrupt:
-        logging.critical("⚠️ Обнаружено повреждение базы данных! Восстановление из бэкапов...")
-        backups = sorted(glob.glob(os.path.join(BACKUP_DIR, "backup_*.db")), key=os.path.getmtime, reverse=True)
-        restored = False
-        for bck in backups:
-            try:
-                test_conn = sqlite3.connect(bck)
-                res = test_conn.execute("PRAGMA quick_check;").fetchone()
-                test_conn.close()
-                if res and res[0] == "ok":
-                    shutil.copy(bck, DB_FILE)
-                    logging.info(f"🟢 База успешно восстановлена из бэкапа: {bck}")
-                    restored = True
-                    break
-            except Exception:
-                continue
-        if not restored:
-            logging.error("🔴 Исправный бэкап не найден.")
-            if os.path.exists(DB_FILE):
-                os.remove(DB_FILE)
+    logging.critical("⚠️ Обнаружено повреждение основной базы данных! Поиск подходящего бэкапа...")
+    backups = sorted(glob.glob(os.path.join(BACKUP_DIR, "backup_*.db")), key=os.path.getmtime, reverse=True)
+    
+    best_backup = None
+    best_max_id = -1
+
+    for bck in backups:
+        bck_max_id, bck_modified = get_db_info(bck)
+        if bck_max_id is not None:
+            if bck_max_id > best_max_id:
+                best_max_id = bck_max_id
+                best_backup = bck
+
+    if best_backup:
+        shutil.copy(best_backup, DB_FILE)
+        logging.info(f"🟢 База данных успешно восстановлена из бэкапа: {best_backup} (Max Op ID: {best_max_id})")
+    else:
+        logging.error("🔴 Ни один исправный бэкап не найден. Файл будет создан с нуля.")
+        if os.path.exists(DB_FILE):
+            os.remove(DB_FILE)
 
 
 async def init_db():
     global db, cursor
+    # 1. Проверяем локальную целостность (без автоматического скачивания с GitHub)
     await asyncio.to_thread(check_and_restore_db)
-    await asyncio.to_thread(_sync_download)
 
     track_sqlite_connect()
     db = sqlite3.connect(DB_FILE, check_same_thread=False)
@@ -433,6 +431,15 @@ async def init_db():
     with db_lock:
         try:
             cursor.execute("PRAGMA journal_mode=WAL;")
+            
+            # Мета-таблица для контроля версий
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS db_meta(
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+            """)
+
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS users(
                 user_id INTEGER PRIMARY KEY,
@@ -476,7 +483,6 @@ async def init_db():
             """)
             log_db_commit("init_db")
 
-            # Первоначальное заполнение кэша известных балансов
             cursor.execute("SELECT user_id, balance FROM users")
             for u_id, bal in cursor.fetchall():
                 KNOWN_BALANCES[u_id] = bal
@@ -1430,7 +1436,7 @@ async def reset(message: Message):
 # ==========================
 
 async def handle_ping(request):
-    return web.Response(text="Bot is running with balance diagnostics!")
+    return web.Response(text="Bot is running with reliable local SQLite storage!")
 
 
 async def start_web_server():
@@ -1537,14 +1543,14 @@ async def main():
     
     # Регистрация фоновых задач
     asyncio.create_task(_github_sync_worker())
-    asyncio.create_task(balance_checker_task())  # <--- Авто-проверка каждые 30 секунд
+    asyncio.create_task(balance_checker_task())
     asyncio.create_task(auto_ping_task())
     asyncio.create_task(auto_backup_task())
     asyncio.create_task(daily_ladushki_task())
     asyncio.create_task(cleanup_db_task())
     
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("🚀 Бот с абсолютным логированием и диагностикой баланса запущен!")
+    logging.info("🚀 Бот с локальной безопасной БД запущен!")
     await dp.start_polling(bot)
 
 
