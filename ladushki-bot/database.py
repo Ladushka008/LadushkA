@@ -3,9 +3,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 import random
 from config import Config
-from github_storage import upload_database
 
-# Словарь доступных титулов
 TITLES = {
     "wood": {"name": "🪵 Деревянный ладушник", "clean_name": "деревянный ладушник", "price": 50},
     "bronze": {"name": "🥉 Бронзовый ладушник", "clean_name": "бронзовый ладушник", "price": 200},
@@ -15,10 +13,8 @@ TITLES = {
 
 
 async def init_db() -> None:
-    """Инициализация таблиц базы данных и миграция."""
     async with aiosqlite.connect(Config.DB_FILE) as db:
         await db.execute("PRAGMA journal_mode=WAL;")
-        
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -31,32 +27,27 @@ async def init_db() -> None:
                 active_title TEXT DEFAULT NULL
             );
         """)
-
-        # Автоматическая миграция: добавляем активный титул, если таблицы созданы ранее
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN active_title TEXT DEFAULT NULL;")
-        except Exception:
-            pass  # Колонка уже существует
-
         await db.execute("""
             CREATE TABLE IF NOT EXISTS inventory (
                 user_id INTEGER,
                 item_name TEXT,
                 quantity INTEGER DEFAULT 0,
-                PRIMARY KEY (user_id, item_name),
-                FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
+                PRIMARY KEY (user_id, item_name)
             );
         """)
-
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS titles (
+            CREATE TABLE IF NOT EXISTS user_titles (
                 user_id INTEGER,
                 title_key TEXT,
-                PRIMARY KEY (user_id, title_key),
-                FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
+                PRIMARY KEY (user_id, title_key)
             );
         """)
-
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS rules (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                rules_text TEXT
+            );
+        """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,36 +59,23 @@ async def init_db() -> None:
                 date TEXT
             );
         """)
-
-        # Таблица для хранения настроек группы (включая правила)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            );
-        """)
-        
         await db.commit()
-        await upload_database()
 
 
 async def ensure_user(user_id: int, username: Optional[str], full_name: str) -> None:
-    """Гарантирует существование пользователя в БД."""
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     async with aiosqlite.connect(Config.DB_FILE) as db:
         await db.execute("""
-            INSERT INTO users (user_id, username, full_name, balance, last_bonus, created_at, reputation)
-            VALUES (?, ?, ?, 0, NULL, ?, 0)
+            INSERT INTO users (user_id, username, full_name, balance, created_at)
+            VALUES (?, ?, ?, 100, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 username = excluded.username,
-                full_name = excluded.full_name;
+                full_name = excluded.full_name
         """, (user_id, username, full_name, now_str))
         await db.commit()
-        await upload_database()
 
 
-async def get_user_data(user_id: int) -> Optional[Tuple[int, Optional[str], str, int, Optional[str], str, int]]:
-    """Возвращает полную запись пользователя."""
+async def get_user_data(user_id: int):
     async with aiosqlite.connect(Config.DB_FILE) as db:
         async with db.execute(
             "SELECT user_id, username, full_name, balance, last_bonus, created_at, reputation FROM users WHERE user_id = ?",
@@ -107,186 +85,100 @@ async def get_user_data(user_id: int) -> Optional[Tuple[int, Optional[str], str,
 
 
 async def get_balance(user_id: int) -> int:
-    """Получить баланс напрямую из БД."""
     async with aiosqlite.connect(Config.DB_FILE) as db:
         async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else 0
 
 
-async def update_balance(user_id: int, delta: int) -> int:
-    """Атомарно изменяет баланс."""
+async def update_balance(user_id: int, amount: int) -> int:
     async with aiosqlite.connect(Config.DB_FILE) as db:
-        await db.execute(
-            "UPDATE users SET balance = MAX(0, balance + ?) WHERE user_id = ?",
-            (delta, user_id)
-        )
+        await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
         await db.commit()
-        await upload_database()
-        
-        async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
-
-
-async def set_balance(user_id: int, new_balance: int) -> int:
-    """Устанавливает конкретное значение баланса."""
-    target_bal = max(0, new_balance)
-    async with aiosqlite.connect(Config.DB_FILE) as db:
-        await db.execute("UPDATE users SET balance = ? WHERE user_id = ?", (target_bal, user_id))
-        await db.commit()
-        await upload_database()
-        return target_bal
+        return await get_balance(user_id)
 
 
 async def claim_daily_bonus(user_id: int) -> Tuple[bool, int, Optional[timedelta]]:
-    """Проверяет и выдает ежедневный бонус."""
-    now = datetime.now()
     async with aiosqlite.connect(Config.DB_FILE) as db:
-        async with db.execute("SELECT last_bonus, balance FROM users WHERE user_id = ?", (user_id,)) as cursor:
+        async with db.execute("SELECT last_bonus FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
-            if not row:
-                return False, 0, None
-            
-            last_bonus_str, _ = row
-            if last_bonus_str:
-                last_bonus_time = datetime.fromisoformat(last_bonus_str)
-                next_bonus_time = last_bonus_time + timedelta(hours=24)
-                if now < next_bonus_time:
-                    return False, 0, (next_bonus_time - now)
+            last_bonus_str = row[0] if row else None
 
-            reward = random.randint(1, 5)
-            await db.execute(
-                "UPDATE users SET balance = balance + ?, last_bonus = ? WHERE user_id = ?",
-                (reward, now.isoformat(), user_id)
-            )
-            await db.commit()
-            await upload_database()
-            return True, reward, None
+        now = datetime.now()
+        if last_bonus_str:
+            last_bonus = datetime.strptime(last_bonus_str, "%Y-%m-%d %H:%M:%S")
+            if now - last_bonus < timedelta(hours=24):
+                time_left = timedelta(hours=24) - (now - last_bonus)
+                return False, 0, time_left
 
-
-async def transfer_balance(sender_id: int, receiver_id: int, amount: int) -> bool:
-    """Атомарный перевод ладушек."""
-    if amount <= 0 or sender_id == receiver_id:
-        return False
-
-    async with aiosqlite.connect(Config.DB_FILE) as db:
-        await db.execute("BEGIN TRANSACTION;")
-        try:
-            async with db.execute("SELECT balance FROM users WHERE user_id = ?", (sender_id,)) as cursor:
-                row = await cursor.fetchone()
-                if not row or row[0] < amount:
-                    await db.execute("ROLLBACK;")
-                    return False
-
-            await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, sender_id))
-            await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, receiver_id))
-            
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            await db.execute(
-                "INSERT INTO history (sender, receiver, amount, action, reason, date) VALUES (?, ?, ?, 'transfer', '', ?)",
-                (sender_id, receiver_id, amount, now_str)
-            )
-            await db.commit()
-            await upload_database()
-            return True
-        except Exception:
-            await db.execute("ROLLBACK;")
-            return False
+        reward = random.randint(50, 150)
+        now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+        await db.execute(
+            "UPDATE users SET balance = balance + ?, last_bonus = ? WHERE user_id = ?",
+            (reward, now_str, user_id)
+        )
+        await db.commit()
+        return True, reward, None
 
 
 async def buy_item(user_id: int, item_name: str, price: int) -> bool:
-    """Покупка предмета."""
     async with aiosqlite.connect(Config.DB_FILE) as db:
-        await db.execute("BEGIN TRANSACTION;")
-        try:
-            async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cursor:
-                row = await cursor.fetchone()
-                if not row or row[0] < price:
-                    await db.execute("ROLLBACK;")
-                    return False
+        async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            if not row or row[0] < price:
+                return False
 
-            await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (price, user_id))
-            await db.execute("""
-                INSERT INTO inventory (user_id, item_name, quantity)
-                VALUES (?, ?, 1)
-                ON CONFLICT(user_id, item_name) DO UPDATE SET quantity = quantity + 1;
-            """, (user_id, item_name))
-            
-            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            await db.execute(
-                "INSERT INTO history (sender, receiver, amount, action, reason, date) VALUES (?, 0, ?, 'buy_item', ?, ?)",
-                (user_id, price, item_name, now_str)
-            )
-            await db.commit()
-            await upload_database()
-            return True
-        except Exception:
-            await db.execute("ROLLBACK;")
-            return False
+        await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (price, user_id))
+        await db.execute("""
+            INSERT INTO inventory (user_id, item_name, quantity)
+            VALUES (?, ?, 1)
+            ON CONFLICT(user_id, item_name) DO UPDATE SET quantity = quantity + 1
+        """, (user_id, item_name))
+        await db.commit()
+        return True
 
 
 async def use_item(user_id: int, item_name: str) -> bool:
-    """Списывает 1 предмет."""
     async with aiosqlite.connect(Config.DB_FILE) as db:
-        async with db.execute(
-            "SELECT quantity FROM inventory WHERE user_id = ? AND item_name = ?", (user_id, item_name)
-        ) as cursor:
+        async with db.execute("SELECT quantity FROM inventory WHERE user_id = ? AND item_name = ?", (user_id, item_name)) as cursor:
             row = await cursor.fetchone()
             if not row or row[0] <= 0:
                 return False
 
-        await db.execute("""
-            UPDATE inventory SET quantity = quantity - 1 WHERE user_id = ? AND item_name = ?
-        """, (user_id, item_name))
+        await db.execute("UPDATE inventory SET quantity = quantity - 1 WHERE user_id = ? AND item_name = ?", (user_id, item_name))
         await db.execute("DELETE FROM inventory WHERE user_id = ? AND item_name = ? AND quantity <= 0", (user_id, item_name))
         await db.commit()
-        await upload_database()
         return True
 
 
 async def get_inventory(user_id: int) -> List[Tuple[str, int]]:
-    """Получает список предметов."""
     async with aiosqlite.connect(Config.DB_FILE) as db:
-        async with db.execute(
-            "SELECT item_name, quantity FROM inventory WHERE user_id = ? AND quantity > 0", (user_id,)
-        ) as cursor:
+        async with db.execute("SELECT item_name, quantity FROM inventory WHERE user_id = ? AND quantity > 0", (user_id,)) as cursor:
             return await cursor.fetchall()
 
 
 async def get_total_items(user_id: int) -> int:
-    """Считает количество предметов."""
     async with aiosqlite.connect(Config.DB_FILE) as db:
-        async with db.execute(
-            "SELECT SUM(quantity) FROM inventory WHERE user_id = ? AND quantity > 0", (user_id,)
-        ) as cursor:
+        async with db.execute("SELECT SUM(quantity) FROM inventory WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
-            return row[0] if row and row[0] is not None else 0
+            return row[0] if (row and row[0]) else 0
 
-
-# --- Функции титулов ---
 
 async def get_user_titles(user_id: int) -> List[str]:
-    """Возвращает купленные титулы."""
     async with aiosqlite.connect(Config.DB_FILE) as db:
-        async with db.execute("SELECT title_key FROM titles WHERE user_id = ?", (user_id,)) as cursor:
+        async with db.execute("SELECT title_key FROM user_titles WHERE user_id = ?", (user_id,)) as cursor:
             rows = await cursor.fetchall()
-            return [row[0] for row in rows]
+            return [r[0] for r in rows]
 
 
 async def get_active_title_key(user_id: int) -> Optional[str]:
-    """Возвращает ключ активного титула."""
     async with aiosqlite.connect(Config.DB_FILE) as db:
-        try:
-            async with db.execute("SELECT active_title FROM users WHERE user_id = ?", (user_id,)) as cursor:
-                row = await cursor.fetchone()
-                return row[0] if row else None
-        except Exception:
-            return None
+        async with db.execute("SELECT active_title FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
 
 
 async def get_active_title(user_id: int) -> Optional[str]:
-    """Возвращает отображаемое название титула."""
     key = await get_active_title_key(user_id)
     if key and key in TITLES:
         return TITLES[key]["name"]
@@ -294,159 +186,53 @@ async def get_active_title(user_id: int) -> Optional[str]:
 
 
 async def buy_title(user_id: int, title_key: str, price: int) -> bool:
-    """Покупка титула."""
     async with aiosqlite.connect(Config.DB_FILE) as db:
-        await db.execute("BEGIN TRANSACTION;")
-        try:
-            async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cursor:
-                row = await cursor.fetchone()
-                if not row or row[0] < price:
-                    await db.execute("ROLLBACK;")
-                    return False
+        async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            if not row or row[0] < price:
+                return False
 
-            await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (price, user_id))
-            await db.execute("INSERT OR IGNORE INTO titles (user_id, title_key) VALUES (?, ?)", (user_id, title_key))
-            await db.commit()
-            await upload_database()
-            return True
-        except Exception:
-            await db.execute("ROLLBACK;")
-            return False
+        await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (price, user_id))
+        await db.execute("INSERT OR IGNORE INTO user_titles (user_id, title_key) VALUES (?, ?)", (user_id, title_key))
+        await db.commit()
+        return True
 
 
 async def set_active_title(user_id: int, title_key: str) -> None:
-    """Устанавливает активный титул."""
     async with aiosqlite.connect(Config.DB_FILE) as db:
         await db.execute("UPDATE users SET active_title = ? WHERE user_id = ?", (title_key, user_id))
         await db.commit()
-        await upload_database()
 
-
-# --- Функции правил ---
 
 async def get_rules() -> Optional[str]:
-    """Получает сохранённые правила группы из БД."""
     async with aiosqlite.connect(Config.DB_FILE) as db:
-        async with db.execute("SELECT value FROM settings WHERE key = 'group_rules'", ()) as cursor:
+        async with db.execute("SELECT rules_text FROM rules WHERE id = 1") as cursor:
             row = await cursor.fetchone()
             return row[0] if row else None
 
 
-async def set_rules(rules_text: str) -> None:
-    """Сохраняет или обновляет правила группы в БД."""
+async def set_rules(text: str) -> None:
     async with aiosqlite.connect(Config.DB_FILE) as db:
-        await db.execute("""
-            INSERT INTO settings (key, value)
-            VALUES ('group_rules', ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
-        """, (rules_text,))
+        await db.execute("INSERT INTO rules (id, rules_text) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET rules_text = excluded.rules_text", (text,))
         await db.commit()
-        await upload_database()
 
 
-# --- Прочие функции ---
-
-async def change_reputation(user_id: int, delta: int) -> Tuple[bool, int]:
-    """Изменяет репутацию."""
+async def change_reputation(user_id: int, delta: int) -> None:
     async with aiosqlite.connect(Config.DB_FILE) as db:
-        async with db.execute("SELECT reputation FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            if not row:
-                return False, 0
-            current_rep = row[0]
-
-        new_rep = max(0, min(10, current_rep + delta))
-        if new_rep == current_rep:
-            return False, current_rep
-
-        await db.execute("UPDATE users SET reputation = ? WHERE user_id = ?", (new_rep, user_id))
+        await db.execute("UPDATE users SET reputation = reputation + ? WHERE user_id = ?", (delta, user_id))
         await db.commit()
-        await upload_database()
-        return True, new_rep
 
 
-async def get_top_rich() -> List[Tuple[int, str, Optional[str], int]]:
-    """Топ 10 по балансу."""
+async def get_random_user(exclude_id: int) -> Optional[int]:
     async with aiosqlite.connect(Config.DB_FILE) as db:
-        async with db.execute("""
-            SELECT user_id, full_name, username, balance
-            FROM users
-            ORDER BY balance DESC
-            LIMIT 10
-        """) as cursor:
-            return await cursor.fetchall()
-
-
-async def get_top_reputation() -> List[Tuple[str, int]]:
-    """Топ 5 по репутации."""
-    async with aiosqlite.connect(Config.DB_FILE) as db:
-        async with db.execute("""
-            SELECT full_name, reputation
-            FROM users
-            ORDER BY reputation DESC
-            LIMIT 5
-        """) as cursor:
-            return await cursor.fetchall()
-
-
-async def get_random_target_for_rat(sender_id: int) -> Optional[Tuple[int, str, int]]:
-    """Случайный игрок для Крысы."""
-    async with aiosqlite.connect(Config.DB_FILE) as db:
-        async with db.execute(
-            "SELECT user_id, full_name, balance FROM users WHERE user_id != ?", (sender_id,)
-        ) as cursor:
+        async with db.execute("SELECT user_id FROM users WHERE user_id != ?", (exclude_id,)) as cursor:
             rows = await cursor.fetchall()
             if not rows:
                 return None
-            return random.choice(rows)
-
-
-async def execute_rat_steal(thief_id: int, victim_id: int, amount: int) -> int:
-    """Кража крысой."""
-    async with aiosqlite.connect(Config.DB_FILE) as db:
-        await db.execute("BEGIN TRANSACTION;")
-        try:
-            async with db.execute("SELECT balance FROM users WHERE user_id = ?", (victim_id,)) as cursor:
-                row = await cursor.fetchone()
-                victim_bal = row[0] if row else 0
-
-            stolen = min(victim_bal, amount)
-            if stolen > 0:
-                await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (stolen, victim_id))
-                await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (stolen, thief_id))
-                
-                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                await db.execute(
-                    "INSERT INTO history (sender, receiver, amount, action, reason, date) VALUES (?, ?, ?, 'rat_steal', '', ?)",
-                    (victim_id, thief_id, stolen, now_str)
-                )
-            await db.commit()
-            await upload_database()
-            return stolen
-        except Exception:
-            await db.execute("ROLLBACK;")
-            return 0
-
-
-async def get_all_active_users() -> Tuple[int, int, List[Tuple[str, int, int, int]]]:
-    """Список всех пользователей."""
-    async with aiosqlite.connect(Config.DB_FILE) as db:
-        async with db.execute("SELECT COUNT(*) FROM users") as c1:
-            total = (await c1.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM users WHERE balance > 0") as c2:
-            active = (await c2.fetchone())[0]
-        async with db.execute("""
-            SELECT full_name, user_id, balance, reputation
-            FROM users
-            WHERE balance > 0
-            ORDER BY balance DESC
-        """) as c3:
-            rows = await c3.fetchall()
-        return total, active, rows
+            return random.choice(rows)[0]
 
 
 async def add_history_entry(sender: int, receiver: int, amount: int, action: str, reason: str = "") -> None:
-    """Запись в историю."""
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     async with aiosqlite.connect(Config.DB_FILE) as db:
         await db.execute(
@@ -454,17 +240,3 @@ async def add_history_entry(sender: int, receiver: int, amount: int, action: str
             (sender, receiver, amount, action, reason, now_str)
         )
         await db.commit()
-        await upload_database()
-
-
-async def get_user_history(user_id: int) -> List[Tuple[str, int, str]]:
-    """История операций."""
-    async with aiosqlite.connect(Config.DB_FILE) as db:
-        async with db.execute("""
-            SELECT action, amount, date
-            FROM history
-            WHERE sender = ? OR receiver = ?
-            ORDER BY id DESC
-            LIMIT 10
-        """, (user_id, user_id)) as cursor:
-            return await cursor.fetchall()
