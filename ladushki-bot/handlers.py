@@ -51,6 +51,7 @@ async def cmd_start(message: Message):
         "• Напишите <b>баланс</b> — чтобы узнать счет.\n"
         "• Напишите <b>бонус</b> — чтобы получить ежедневный бонус.\n"
         "• Напишите <b>правила</b> или <b>права</b> — чтобы прочитать правила группы.\n"
+        "• Напишите <b>изменить правила</b> — чтобы обновить правила (только для админа).\n"
         "• Напишите <b>минута ладушек</b> — узнать время проведения минуты ладушек.\n"
         "• Напишите <b>титулы</b> — открыть магазин титулов.\n"
         "• Напишите <b>мои титулы</b> — посмотреть свои титулы и выбрать активный.\n"
@@ -71,30 +72,22 @@ async def cmd_start(message: Message):
 @router.message(F.text.lower().in_(["правила", "права", "📜 правила"]))
 async def rules_handler(message: Message):
     rules_text = await db.get_rules() if hasattr(db, "get_rules") else None
-    is_admin = (message.from_user.id == Config.ADMIN_ID)
-
-    buttons = []
-    if is_admin:
-        btn_text = "✏️ Изменить правила" if rules_text else "➕ Добавить правила"
-        buttons.append([InlineKeyboardButton(text=btn_text, callback_data="add_rules_start")])
-
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
 
     if rules_text:
-        await message.answer(f"📜 <b>Правила группы:</b>\n\n{rules_text}", reply_markup=kb)
+        await message.answer(f"📜 <b>Правила группы:</b>\n\n{rules_text}")
     else:
         text = (
             "📜 <b>Правила</b>\n\n"
             "Правила ещё не установлены.\n"
             "Создайте правила для вашей группы, чтобы участники могли ознакомиться с ними."
         )
-        await message.answer(text, reply_markup=kb)
+        await message.answer(text)
 
 
-@router.callback_query(F.data == "add_rules_start")
-async def add_rules_start_callback(query: CallbackQuery, state: FSMContext):
-    if query.from_user.id != Config.ADMIN_ID:
-        await query.answer("⛔ Только администратор может изменять правила.", show_alert=True)
+@router.message(F.text.lower() == "изменить правила")
+async def edit_rules_start(message: Message, state: FSMContext):
+    if message.from_user.id != Config.ADMIN_ID:
+        await message.reply("❌ Только администраторы могут изменять правила.")
         return
 
     await state.set_state(RulesState.waiting_for_rules)
@@ -103,8 +96,7 @@ async def add_rules_start_callback(query: CallbackQuery, state: FSMContext):
         inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_rules_input")]]
     )
     
-    await query.message.answer("📝 Отправьте текст правил для вашей группы:", reply_markup=kb)
-    await query.answer()
+    await message.answer("📝 Отправьте новый текст правил для вашей группы:", reply_markup=kb)
 
 
 @router.callback_query(F.data == "cancel_rules_input")
@@ -124,10 +116,7 @@ async def process_rules_input(message: Message, state: FSMContext):
         await db.set_rules(new_rules)
 
     await state.clear()
-    await message.reply(
-        "✅ <b>Правила успешно установлены!</b>\n\n"
-        "Теперь участники смогут открыть раздел «📜 Правила» и ознакомиться с ними."
-    )
+    await message.reply("✅ Правила успешно обновлены!")
 
 
 # ---------------------------------------------------------
