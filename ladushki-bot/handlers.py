@@ -30,8 +30,6 @@ def get_mention(user) -> str:
     return f'<a href="{url}">{user.full_name}</a>'
 
 
-# --- БАЗОВЫЕ И ИНФОРМАЦИОННЫЕ КОМАНДЫ ---
-
 @router.message(F.text.lower() == "бот")
 async def bot_reply(message: Message):
     await message.reply("Тут я, тут")
@@ -47,22 +45,20 @@ async def cmd_start(message: Message):
     await db.ensure_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
     await message.answer(
         "✨ <b>Добро пожаловать в бота сообщества Ладушки!</b>\n\n"
-        "💬 <b>Команды:</b>\n"
-        "• Напишите <b>профиль</b> — посмотреть свой профиль.\n"
-        "• Напишите <b>баланс</b> — узнать счет.\n"
-        "• Напишите <b>бонус</b> — получить ежедневный бонус.\n"
-        "• Напишите <b>правила</b> или <b>права</b> — прочитать правила.\n"
-        "• Напишите <b>изменить правила</b> — обновить правила (для админа).\n"
-        "• Напишите <b>минута ладушек</b> — время проведения минуты ладушек.\n"
-        "• Напишите <b>титулы</b> — магазин титулов.\n"
-        "• Напишите <b>мои титулы</b> — свои титулы и активный титул.\n"
-        "• Напишите <b>магазин</b> — открыть магазин предметов.\n"
-        "• Напишите <b>инвентарь</b> — посмотреть свои предметы.\n"
-        "• Напишите <b>крыса</b> — запустить крысу украсть ладушки у игрока.\n"
-        "• Ответьте на сообщение текстом <b>подарок</b> или <b>ладошка</b> — передать 1 ладушку.\n"
-        "• Ответьте на сообщение текстом <b>дать [число]</b> — перевести ладушки.\n"
-        "• Ответьте на сообщение текстом <b>ударить ладушкой</b> — применить Боевую ладушку.\n"
-        "• Ответьте на сообщение текстом <b>кинуть томат</b> — бросить томат в участника."
+        "💬 <b>Основные команды:</b>\n"
+        "• <b>профиль</b> — посмотреть свой профиль\n"
+        "• <b>баланс</b> — узнать счет\n"
+        "• <b>бонус</b> — ежедневный бонус\n"
+        "• <b>правила</b> — прочитать правила группы\n"
+        "• <b>титулы</b> — магазин титулов\n"
+        "• <b>мои титулы</b> — выбор титула\n"
+        "• <b>магазин</b> — магазин предметов\n"
+        "• <b>инвентарь</b> — ваш инвентарь\n"
+        "• <b>репутация</b> — топ участников\n"
+        "• <b>крыса</b> — запустить крысу\n\n"
+        "🥊 <b>Боевые команды (ответом на сообщение):</b>\n"
+        "• <b>ударить ладушкой</b> — применить Боевую ладушку\n"
+        "• <b>кинуть томат</b> — бросить томат"
     )
 
 
@@ -108,7 +104,7 @@ async def process_rules_input(message: Message, state: FSMContext):
     await message.reply("✅ Правила успешно обновлены!")
 
 
-# --- ПРОФИЛЬ И БАЛАНС ---
+# --- ПРОФИЛЬ И СТАТИСТИКА ---
 
 @router.message(F.text.lower() == "профиль")
 async def profile_handler(message: Message):
@@ -173,7 +169,20 @@ async def bonus_handler(message: Message):
         )
 
 
-# --- МАГАЗИН И ИНВЕНТАРЬ ---
+@router.message(F.text.lower() == "репутация")
+async def reputation_top_handler(message: Message):
+    top_list = await db.get_top_reputation()
+    if not top_list:
+        await message.answer("⭐ Список репутации пуст.")
+        return
+
+    text = "⭐ <b>Топ участников по репутации:</b>\n\n"
+    for i, (name, rep) in enumerate(top_list, 1):
+        text += f"{i}. <b>{name}</b> — {rep} ⭐\n"
+    await message.answer(text)
+
+
+# --- МАГАЗИН И ПРЕДМЕТЫ ---
 
 @router.message(F.text.lower() == "магазин")
 async def shop_handler(message: Message):
@@ -251,7 +260,7 @@ async def inventory_handler(message: Message):
     await message.reply(text)
 
 
-# --- ИГРОВЫЕ ДЕЙСТВИЯ И ПРЕДМЕТЫ ---
+# --- ИГРОВЫЕ ДЕЙСТВИЯ ---
 
 @router.message(F.text.lower() == "ударить ладушкой")
 async def use_battle_ladushka(message: Message):
@@ -343,7 +352,7 @@ async def titles_shop_handler(message: Message):
         "🥉 <b>Бронзовый ладушник</b> — 200 👏\n"
         "🥈 <b>Серебряный ладушник</b> — 600 👏\n"
         "🥇 <b>Золотой ладушник</b> — 1000 👏\n\n"
-        "<i>Чтобы купить титул, напишите его точное название.</i>"
+        "<i>Чтобы купить титул, напишите его название.</i>"
     )
     await message.answer(text)
 
@@ -378,7 +387,58 @@ async def my_titles_handler(message: Message):
     await message.answer(text, reply_markup=kb)
 
 
-# УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК ДЛЯ ТИТУЛОВ (СТРОГО В КОНЦЕ!)
+# --- АДМИНИСТРАТИВНЫЕ КОМАНДЫ ---
+
+@router.message(Command("set_balance"))
+async def admin_set_balance(message: Message):
+    if message.from_user.id != Config.ADMIN_ID or not message.reply_to_message or not message.reply_to_message.from_user:
+        return
+
+    target = message.reply_to_message.from_user
+    await db.ensure_user(target.id, target.username, target.full_name)
+
+    args = message.text.split()
+    if len(args) != 2 or not args[1].isdigit():
+        await message.reply("❌ Использование: ответьте на сообщение и напишите /set_balance [сумма]")
+        return
+
+    amount = int(args[1])
+    await db.set_balance(target.id, amount)
+    await message.answer(f"✅ Баланс игрока {get_mention(target)} изменён на {amount}.", disable_web_page_preview=True)
+
+
+@router.message(Command("admin_bonus"))
+async def admin_bonus(message: Message):
+    if message.from_user.id != Config.ADMIN_ID or not message.reply_to_message or not message.reply_to_message.from_user:
+        return
+
+    target = message.reply_to_message.from_user
+    await db.ensure_user(target.id, target.username, target.full_name)
+
+    args = message.text.split()
+    if len(args) < 2 or not args[1].isdigit():
+        await message.reply("❌ Использование: ответьте на сообщение и напишите /admin_bonus [сумма]")
+        return
+
+    amount = int(args[1])
+    await db.update_balance(target.id, amount)
+    await db.add_history_entry(Config.ADMIN_ID, target.id, amount, "admin_bonus")
+
+    await message.answer(f"🎁 Игрок {get_mention(target)} получил бонус {amount} ладушек.", disable_web_page_preview=True)
+
+
+@router.message(Command("reset"))
+async def admin_reset(message: Message):
+    if message.from_user.id != Config.ADMIN_ID or not message.reply_to_message or not message.reply_to_message.from_user:
+        return
+
+    target = message.reply_to_message.from_user
+    await db.reset_user(target.id)
+    await message.answer(f"🔄 Данные игрока {get_mention(target)} сброшены.", disable_web_page_preview=True)
+
+
+# --- УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК ПОКУПКИ ТИТУЛОВ (СТРОГО В САМОМ КОНЦЕ!) ---
+
 @router.message(F.text)
 async def title_buy_request(message: Message):
     user_text = message.text.strip().lower()
