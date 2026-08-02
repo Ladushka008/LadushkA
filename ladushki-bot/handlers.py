@@ -30,6 +30,8 @@ def get_mention(user) -> str:
     return f'<a href="{url}">{user.full_name}</a>'
 
 
+# --- БАЗОВЫЕ И ИНФОРМАЦИОННЫЕ КОМАНДЫ ---
+
 @router.message(F.text.lower() == "бот")
 async def bot_reply(message: Message):
     await message.reply("Тут я, тут")
@@ -46,21 +48,19 @@ async def cmd_start(message: Message):
     await message.answer(
         "✨ <b>Добро пожаловать в бота сообщества Ладушки!</b>\n\n"
         "💬 <b>Команды:</b>\n"
-        "• Напишите <b>профиль</b> — чтобы посмотреть свой профиль.\n"
-        "• Напишите <b>баланс</b> — чтобы узнать счет.\n"
-        "• Напишите <b>бонус</b> — чтобы получить ежедневный бонус.\n"
-        "• Напишите <b>правила</b> или <b>права</b> — чтобы прочитать правила группы.\n"
-        "• Напишите <b>изменить правила</b> — чтобы обновить правила (только для админа).\n"
-        "• Напишите <b>минута ладушек</b> — узнать время проведения минуты ладушек.\n"
-        "• Напишите <b>титулы</b> — открыть магазин титулов.\n"
-        "• Напишите <b>мои титулы</b> — посмотреть свои титулы и выбрать активный.\n"
-        "• Напишите <b>баскетбол 50</b> — сыграть в баскетбольную мини-игру 🏀\n"
-        "• Напишите <b>магазин</b> — чтобы открыть магазин предметов.\n"
-        "• Напишите <b>инвентарь</b> — чтобы посмотреть свои предметы.\n"
-        "• Напишите <b>репутация</b> — чтобы увидеть ТОП-5 по репутации.\n"
-        "• Напишите <b>крыса</b> — запустить крысу украсть ладушки у случайного игрока.\n"
-        "• Ответьте на сообщение текстом <b>подарок</b> или <b>ладошка</b> — чтобы передать 1 ладушку игроку.\n"
-        "• Ответьте на сообщение текстом <b>дать 50</b> — чтобы перевести ладушки.\n"
+        "• Напишите <b>профиль</b> — посмотреть свой профиль.\n"
+        "• Напишите <b>баланс</b> — узнать счет.\n"
+        "• Напишите <b>бонус</b> — получить ежедневный бонус.\n"
+        "• Напишите <b>правила</b> или <b>права</b> — прочитать правила.\n"
+        "• Напишите <b>изменить правила</b> — обновить правила (для админа).\n"
+        "• Напишите <b>минута ладушек</b> — время проведения минуты ладушек.\n"
+        "• Напишите <b>титулы</b> — магазин титулов.\n"
+        "• Напишите <b>мои титулы</b> — свои титулы и активный титул.\n"
+        "• Напишите <b>магазин</b> — открыть магазин предметов.\n"
+        "• Напишите <b>инвентарь</b> — посмотреть свои предметы.\n"
+        "• Напишите <b>крыса</b> — запустить крысу украсть ладушки у игрока.\n"
+        "• Ответьте на сообщение текстом <b>подарок</b> или <b>ладошка</b> — передать 1 ладушку.\n"
+        "• Ответьте на сообщение текстом <b>дать [число]</b> — перевести ладушки.\n"
         "• Ответьте на сообщение текстом <b>ударить ладушкой</b> — применить Боевую ладушку.\n"
         "• Ответьте на сообщение текстом <b>кинуть томат</b> — бросить томат в участника."
     )
@@ -70,7 +70,7 @@ async def cmd_start(message: Message):
 
 @router.message(F.text.lower().in_(["правила", "права", "📜 правила"]))
 async def rules_handler(message: Message):
-    rules_text = await db.get_rules() if hasattr(db, "get_rules") else None
+    rules_text = await db.get_rules()
     if rules_text:
         await message.answer(f"📜 <b>Правила группы:</b>\n\n{rules_text}")
     else:
@@ -103,9 +103,7 @@ async def process_rules_input(message: Message, state: FSMContext):
         return
 
     new_rules = message.text
-    if hasattr(db, "set_rules"):
-        await db.set_rules(new_rules)
-
+    await db.set_rules(new_rules)
     await state.clear()
     await message.reply("✅ Правила успешно обновлены!")
 
@@ -171,7 +169,7 @@ async def bonus_handler(message: Message):
     if success:
         await db.add_history_entry(0, user.id, reward, "daily_bonus")
         await message.reply(
-            f"🎁 <b>Ежедневный бонус!</b>\n\n💰 Ты получил: <b>+{reward}</b> ладушки"
+            f"🎁 <b>Ежедневный бонус!</b>\n\n💰 Ты получил: <b>+{reward}</b> ладушек"
         )
 
 
@@ -180,14 +178,14 @@ async def bonus_handler(message: Message):
 @router.message(F.text.lower() == "магазин")
 async def shop_handler(message: Message):
     text = (
-        "🛒 <b>Магазин Ладушек</b>\n\n"
+        "🛒 <b>Магазин Предметов</b>\n\n"
         "🥊 <b>Боевая ладушка</b> — 200 ладушек\n"
         "🍅 <b>Томат</b> — 100 ладушек\n"
         "🐀 <b>Крыса</b> — 250 ладушек\n\n"
-        "Для покупки:\n"
-        "<code>купить ладушка</code>\n"
-        "<code>купить томат</code>\n"
-        "<code>купить крыса</code>"
+        "Для покупки напишите:\n"
+        "• <code>купить ладушка</code>\n"
+        "• <code>купить томат</code>\n"
+        "• <code>купить крыса</code>"
     )
     await message.answer(text)
 
@@ -240,7 +238,7 @@ async def inventory_handler(message: Message):
         await message.reply("🎒 Ваш инвентарь пуст.")
         return
 
-    text = "🎒 <b>Ваш инвентарь</b>\n\n"
+    text = "🎒 <b>Ваш инвентарь:</b>\n\n"
     for item_name, quantity in items:
         if item_name == "battle_ladushka":
             text += f"🥊 <b>Боевая ладушка</b> ×{quantity}\n"
@@ -253,6 +251,88 @@ async def inventory_handler(message: Message):
     await message.reply(text)
 
 
+# --- ИГРОВЫЕ ДЕЙСТВИЯ И ПРЕДМЕТЫ ---
+
+@router.message(F.text.lower() == "ударить ладушкой")
+async def use_battle_ladushka(message: Message):
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.reply("❌ Ответьте на сообщение игрока, которого хотите ударить!")
+        return
+
+    attacker = message.from_user
+    target = message.reply_to_message.from_user
+
+    if target.id == attacker.id or target.is_bot:
+        await message.reply("❌ Нельзя применить это действие на себя или бота.")
+        return
+
+    await db.ensure_user(attacker.id, attacker.username, attacker.full_name)
+    await db.ensure_user(target.id, target.username, target.full_name)
+
+    if not await db.use_item(attacker.id, "battle_ladushka"):
+        await message.reply("❌ У вас нет Боевой ладушки в инвентаре! Купите её в магазине.")
+        return
+
+    target_balance = await db.get_balance(target.id)
+    stolen = min(target_balance, 100)
+    
+    if stolen > 0:
+        await db.update_balance(target.id, -stolen)
+        await db.update_balance(attacker.id, stolen)
+        await message.reply(f"🥊 {get_mention(attacker)} ударил ладушкой {get_mention(target)} и отобрал <b>{stolen}</b> ладушек!")
+    else:
+        await message.reply(f"🥊 {get_mention(attacker)} ударил ладушкой {get_mention(target)}, но у него нечего забрать!")
+
+
+@router.message(F.text.lower() == "кинуть томат")
+async def use_tomato(message: Message):
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.reply("❌ Ответьте на сообщение игрока, в которого хотите бросить томат!")
+        return
+
+    attacker = message.from_user
+    target = message.reply_to_message.from_user
+
+    if target.id == attacker.id or target.is_bot:
+        await message.reply("❌ Нельзя бросить томат в себя или в бота.")
+        return
+
+    await db.ensure_user(attacker.id, attacker.username, attacker.full_name)
+    await db.ensure_user(target.id, target.username, target.full_name)
+
+    if not await db.use_item(attacker.id, "tomato"):
+        await message.reply("❌ У вас нет томата! Купите его в магазине.")
+        return
+
+    await db.change_reputation(target.id, -1)
+    await message.reply(f"🍅 {get_mention(attacker)} бросил томат в {get_mention(target)}! Репутация жертвы понижена.")
+
+
+@router.message(F.text.lower() == "крыса")
+async def use_rat(message: Message):
+    user = message.from_user
+    await db.ensure_user(user.id, user.username, user.full_name)
+
+    if not await db.use_item(user.id, "rat"):
+        await message.reply("❌ У вас нет крысы! Купите её в магазине.")
+        return
+
+    victim_id = await db.get_random_user(exclude_id=user.id)
+    if not victim_id:
+        await message.reply("🐀 Крыса побегала, но не нашла жертву.")
+        return
+
+    victim_bal = await db.get_balance(victim_id)
+    stolen = min(victim_bal, random.randint(30, 80))
+
+    if stolen > 0:
+        await db.update_balance(victim_id, -stolen)
+        await db.update_balance(user.id, stolen)
+        await message.reply(f"🐀 Ваша крыса проникла к случайному игроку и утащила <b>{stolen}</b> ладушек!")
+    else:
+        await message.reply("🐀 Ваша крыса прибежала пустой.")
+
+
 # --- ТИТУЛЫ ---
 
 @router.message(F.text.lower() == "титулы")
@@ -263,7 +343,7 @@ async def titles_shop_handler(message: Message):
         "🥉 <b>Бронзовый ладушник</b> — 200 👏\n"
         "🥈 <b>Серебряный ладушник</b> — 600 👏\n"
         "🥇 <b>Золотой ладушник</b> — 1000 👏\n\n"
-        "<i>Чтобы купить титул, напишите его название.</i>"
+        "<i>Чтобы купить титул, напишите его точное название.</i>"
     )
     await message.answer(text)
 
@@ -298,7 +378,7 @@ async def my_titles_handler(message: Message):
     await message.answer(text, reply_markup=kb)
 
 
-# Текстовая покупка титула теперь внизу, чтобы не перехватывать все остальные команды!
+# УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК ДЛЯ ТИТУЛОВ (СТРОГО В КОНЦЕ!)
 @router.message(F.text)
 async def title_buy_request(message: Message):
     user_text = message.text.strip().lower()
