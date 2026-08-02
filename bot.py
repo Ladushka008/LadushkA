@@ -476,6 +476,7 @@ async def start(message: Message):
         "• Напишите <b>профиль</b> — чтобы посмотреть свой профиль.\n"
         "• Напишите <b>баланс</b> — чтобы узнать счет.\n"
         "• Напишите <b>бонус</b> — чтобы получить ежедневный бонус.\n"
+        "• Напишите <b>баскетбол</b> — сыграть в баскетбольную мини-игру 🏀\n"
         "• Напишите <b>магазин</b> — чтобы открыть магазин предметов.\n"
         "• Напишите <b>инвентарь</b> — чтобы посмотреть свои предметы.\n"
         "• Напишите <b>репутация</b> — чтобы увидеть ТОП-5 по репутации.\n"
@@ -485,6 +486,52 @@ async def start(message: Message):
         "• Ответьте на сообщение текстом <b>ударить ладушкой</b> — применить Боевую ладушку.\n"
         "• Ответьте на сообщение текстом <b>кинуть томат</b> — бросить томат в участника."
     )
+
+
+# --- МИНИ-ИГРА БАСКЕТБОЛ ---
+
+@dp.message(Command("basketball"))
+@dp.message(F.text.lower().in_(["баскетбол", "баскет"]))
+async def basketball_game(message: Message):
+    user = message.from_user
+    if not is_user_registered(user.id):
+        await message.reply("⚠️ Вы еще не зарегистрированы.\nПожалуйста, сначала откройте бота и нажмите /start.")
+        return
+
+    # 1. Отправляем кубик баскетбола
+    dice_msg = await message.answer_dice(emoji="🏀")
+    score = dice_msg.dice.value
+
+    # 2. Ждем окончания анимации Telegram (около 3.5 сек)
+    await asyncio.sleep(3.5)
+
+    # 3. Значения 4 и 5 соответствуют попаданию в корзину
+    if score >= 4:
+        reward = 10
+        with db_lock:
+            try:
+                cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (reward, user.id))
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                print(f"Ошибка при зачислении наград в баскетболе: {e}")
+                return
+
+        save_db_changes()
+        add_history(0, user.id, reward, "basketball_win")
+        new_balance = get_balance(user.id)
+
+        await message.reply(
+            f"🏀 <b>ТОЧНЫЙ БРОСОК!</b>\n\n"
+            f"🎉 Попадание в корзину!\n"
+            f"💰 Вы получили: <b>+{reward}</b> ладушек 👏\n"
+            f"🪙 Ваш баланс: <b>{new_balance}</b>"
+        )
+    else:
+        await message.reply(
+            f"❌ <b>ПРОМАХ!</b>\n\n"
+            f"😅 Мяч пролетел мимо корзины. Попробуйте еще раз!"
+        )
 
 
 @dp.message(F.text.lower() == "профиль")
