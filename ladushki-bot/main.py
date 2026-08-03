@@ -77,7 +77,6 @@ async def auto_ping_task() -> None:
         success = False
         
         async with aiohttp.ClientSession() as session:
-            # Попытка 1
             for attempt in range(1, 3):
                 try:
                     async with session.get(url, timeout=15) as response:
@@ -91,7 +90,6 @@ async def auto_ping_task() -> None:
                     logging.warning(f"🔴 Ошибка автопинга (попытка {attempt}): {e}")
                 
                 if attempt == 1:
-                    # Небольшая пауза перед 2 попыткой
                     await asyncio.sleep(5)
 
         if not success:
@@ -102,23 +100,44 @@ async def daily_ladushki_task(bot: Bot) -> None:
     kyiv_tz = zoneinfo.ZoneInfo("Europe/Kyiv")
     while True:
         now = datetime.now(kyiv_tz)
-        target_time = now.replace(hour=19, minute=0, second=0, microsecond=0)
-        if now >= target_time:
-            target_time += timedelta(days=1)
+        
+        # Расчет времени для 19:00
+        target_1900 = now.replace(hour=19, minute=0, second=0, microsecond=0)
+        # Расчет времени для 19:05
+        target_1905 = now.replace(hour=19, minute=5, second=0, microsecond=0)
+
+        # Определяем ближайшую задачу
+        if now < target_1900:
+            target_time = target_1900
+            task_type = "19:00"
+        elif now < target_1905:
+            target_time = target_1905
+            task_type = "19:05"
+        else:
+            # Если уже позже 19:05, то ждем 19:00 следующего дня
+            target_time = target_1900 + timedelta(days=1)
+            task_type = "19:00"
 
         wait_seconds = (target_time - now).total_seconds()
-        logging.info(f"⏳ Следующее сообщение запланировано на {target_time.strftime('%d.%m.%Y %H:%M:%S')}")
+        logging.info(f"⏳ Следующая рассылка ({task_type}) запланирована на {target_time.strftime('%d.%m.%Y %H:%M:%S')}")
         await asyncio.sleep(wait_seconds)
 
         try:
-            text = (
-                "🕖 19:00 — Время петь «Ладушки»!\n"
-                "🎶 Ладушки, ладушки, где были? У бабушки!"
-            )
+            if task_type == "19:00":
+                text = (
+                    "🕖 19:00 — Время петь «Ладушки»!\n"
+                    "🎶 Ладушки, ладушки, где были? У бабушки!"
+                )
+            else:  # 19:05
+                text = (
+                    "❤️ Спасибо каждому, кто был сегодня с нами!\n"
+                    "До встречи завтра в 19:00."
+                )
+            
             await bot.send_message(chat_id=Config.GROUP_CHAT_ID, text=text)
-            logging.info("📢 Ежедневное сообщение отправлено!")
+            logging.info(f"📢 Ежедневное сообщение ({task_type}) успешно отправлено!")
         except Exception as e:
-            logging.error(f"🔴 Ошибка отправки ежедневного сообщения: {e}")
+            logging.error(f"🔴 Ошибка отправки сообщения ({task_type}): {e}")
 
 
 async def main() -> None:
