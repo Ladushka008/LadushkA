@@ -6,7 +6,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import Message
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 
 from config import Config
 
@@ -17,10 +17,36 @@ logging.basicConfig(
 
 dp = Dispatcher()
 
+# Создание обычной клавиатуры (Reply Keyboard)
+main_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🕖 Когда Минута ладушек?")],
+        [KeyboardButton(text="ℹ️ Что такое Минута ладушек?")]
+    ],
+    resize_keyboard=True
+)
 
-@dp.message(F.text.lower() == "минута ладушек")
-async def ladushka_minute_handler(message: Message):
+
+@dp.message(F.text == "/start")
+async def cmd_start(message: Message):
+    text = (
+        "👋 Добро пожаловать в бот «Минута ладушек»!\n\n"
+        "Здесь каждый день в 19:00 по киевскому времени проходит Минута ладушек.\n"
+        "🕖 В назначенное время бот автоматически отправляет сообщение:\n"
+        "🕖 19:00 — Время петь «Ладушки»!\n"
+        "🎶 Ладушки, ладушки, где были? У бабушки!"
+    )
+    await message.answer(text, reply_markup=main_keyboard)
+
+
+@dp.message(F.text == "🕖 Когда Минута ладушек?")
+async def when_ladushka_handler(message: Message):
     await message.answer("👏 Минута ладушек проходит каждый день в 19:00 по киевскому времени.")
+
+
+@dp.message(F.text == "ℹ️ Что такое Минута ладушек?")
+async def about_ladushka_handler(message: Message):
+    await message.answer("👏 Минута ладушек — это ежедневная традиция, которая проходит каждый день в 19:00 по киевскому времени.")
 
 
 async def handle_ping(request: web.Request) -> web.Response:
