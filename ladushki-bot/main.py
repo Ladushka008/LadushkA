@@ -101,12 +101,9 @@ async def daily_ladushki_task(bot: Bot) -> None:
     while True:
         now = datetime.now(kyiv_tz)
         
-        # Расчет времени для 19:00
         target_1900 = now.replace(hour=19, minute=0, second=0, microsecond=0)
-        # Расчет времени для 19:05
         target_1905 = now.replace(hour=19, minute=5, second=0, microsecond=0)
 
-        # Определяем ближайшую задачу
         if now < target_1900:
             target_time = target_1900
             task_type = "19:00"
@@ -114,7 +111,6 @@ async def daily_ladushki_task(bot: Bot) -> None:
             target_time = target_1905
             task_type = "19:05"
         else:
-            # Если уже позже 19:05, то ждем 19:00 следующего дня
             target_time = target_1900 + timedelta(days=1)
             task_type = "19:00"
 
@@ -128,7 +124,7 @@ async def daily_ladushki_task(bot: Bot) -> None:
                     "🕖 19:00 — Время петь «Ладушки»!\n"
                     "🎶 Ладушки, ладушки, где были? У бабушки!"
                 )
-            else:  # 19:05
+            else:
                 text = (
                     "❤️ Спасибо каждому, кто был сегодня с нами!\n"
                     "До встречи завтра в 19:00."
