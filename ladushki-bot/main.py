@@ -55,6 +55,38 @@ async def ladushka_minute_handler(message: Message):
     await message.answer("👏 Минута ладушек проходит каждый день в 19:00 по киевскому времени.")
 
 
+@dp.message(F.text.startswith("/sms"))
+async def cmd_sms(message: Message):
+    # Проверяем, является ли пользователь администратором
+    # (Используем ADMIN_ID из config, который по умолчанию равен вашему ID)
+    if message.from_user.id != Config.ADMIN_ID:
+        # Если не администратор — тихо игнорируем или можно уведомить
+        return
+
+    # Извлекаем текст после команды /sms
+    parts = message.text.split(maxsplit=1)
+    
+    # Удаляем сообщение администратора с командой
+    try:
+        await message.delete()
+    except Exception as e:
+        logging.error(f"Не удалось удалить сообщение с командой /sms: {e}")
+
+    # Если текст после /sms не указан
+    if len(parts) < 2:
+        await message.answer("⚠️ Пожалуйста, укажите текст после команды /sms.")
+        return
+
+    sms_text = parts[1]
+
+    # Отправляем сообщение от имени бота в чат
+    try:
+        await message.bot.send_message(chat_id=message.chat.id, text=sms_text)
+        logging.info(f"📤 Администратор отправил через /sms: {sms_text}")
+    except Exception as e:
+        logging.error(f"🔴 Ошибка отправки сообщения /sms: {e}")
+
+
 async def handle_ping(request: web.Request) -> web.Response:
     return web.Response(text="Bot is operational!")
 
